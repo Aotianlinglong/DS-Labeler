@@ -1,0 +1,14 @@
+Dataset Labeler (DS-Labeler)
+Copyright 2026 Aotianlinglong
+
+This product includes software developed as part of the following projects:
+
+  - GAME (https://github.com/openvpi/GAME)
+    ONNX models are licensed under CC BY-NC-SA 4.0 (non-commercial).
+  - Retrieval-based-Voice-Conversion-WebUI (https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)
+    RMVPE ONNX model.
+  - DiffSinger / MakeDiffSinger (https://github.com/openvpi/DiffSinger, https://github.com/openvpi/MakeDiffSinger)
+    Dataset format and pipeline conventions.
+
+Third-party components are obtained separately and are not bundled with this repository.
+See CREDITS.md for the full list and license details.

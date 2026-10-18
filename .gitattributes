@@ -1,0 +1,11 @@
+# 统一换行：仓库内一律 LF，签出时按平台自动还原
+* text=auto
+
+# Windows 批处理：不做换行归一化，仓库里就存 CRLF（个别工具对 LF 结尾的 .bat 解析异常）
+*.bat -text
+
+# 二进制文件不做换行转换
+*.onnx binary
+*.png binary
+*.jpg binary
+*.wav binary
