@@ -17,7 +17,8 @@ import numpy as np
 import soundfile as sf
 from PySide6.QtCore import QThread, Signal
 
-from core.paths import GAME_MODEL_DIR, RMVPE_MODEL
+from core.curve import FPS as CURVE_FPS, MouthCurveExtractor, save_curve
+from core.paths import GAME_MODEL_DIR, MOUTH_MODEL, RMVPE_MODEL
 from core.sentence import SentenceData
 from core.textgrid_io import parse_textgrid
 from engine.f0 import F0Extractor, save_f0
@@ -235,3 +236,96 @@ class InferenceWorker(QThread):
             uv_vocab=set(self.project.uv_vocab),
             lang=self.project.main_lang,
         )
+
+
+class MouthCurveWorker(QThread):
+    """后台计算**口型曲线**（R3MOE）：逐句推理 → 落缓存 `<curve_dir>/<句名>.npz` → 回传主线程。
+
+    与 InferenceWorker 分开的原因：口型是**独立可关的面板**，默认不开；开了才建会话/算缓存，
+    彼此不互相牵制（「批量预处理」不该顺带算出没人看的口型）。两个入口共用同一个线程：
+      · 切句时缺缓存且面板可见 → enqueue([当前句], front=True)
+      · 菜单「计算所有文件口型」    → enqueue(全部句名)
+    已有缓存默认跳过；权重缺失时直接报一次失败并清空队列（不逐句刷屏）。
+
+    走 **CPU**：小模型（约 40MB）+ 双层 BiLSTM，CPU 足够；也避免和 GAME 抢 DML 显存。
+    """
+
+    sig_progress = Signal(str, int, int)      # 当前句名, 已完成, 总数
+    sig_curve = Signal(str, object, float)    # 句名, np.ndarray, fps
+    sig_failed = Signal(str, str)             # 句名, 错误
+    sig_idle = Signal()                       # 队列处理完毕
+
+    def __init__(self, project, parent=None):
+        super().__init__(parent)
+        self.project = project
+        self._queue: collections.deque[str] = collections.deque()
+        self._stop = False
+
+    # ---- 队列管理（主线程调用） ---------------------------------------
+    def enqueue(self, names, front: bool = False, skip_cached: bool = True) -> int:
+        names = [n for n in names if n]
+        if skip_cached:
+            names = [n for n in names if not self._is_cached(n)]
+        if not names:
+            return 0
+        if front:
+            for n in reversed(names):
+                if n in self._queue:
+                    self._queue.remove(n)
+                self._queue.appendleft(n)
+        else:
+            for n in names:
+                if n not in self._queue:
+                    self._queue.append(n)
+        self._stop = False
+        if not self.isRunning():
+            self.start()
+        return len(names)
+
+    def stop(self) -> None:
+        self._stop = True
+        self._queue.clear()
+
+    def set_project(self, project) -> None:
+        self._queue.clear()
+        self.project = project
+
+    def busy(self) -> bool:
+        return self.isRunning()
+
+    def _curve_path(self, name: str):
+        return self.project.curve_dir / f"{name}.npz"
+
+    def _is_cached(self, name: str) -> bool:
+        return self._curve_path(name).exists()
+
+    # ---- 线程主体 -----------------------------------------------------
+    def run(self) -> None:
+        done = 0
+        extractor = MouthCurveExtractor(MOUTH_MODEL)
+        if not extractor.available():
+            # 权重缺失（用户未自备）：报一次就好，别逐句刷错
+            self.sig_failed.emit(self._queue[0] if self._queue else "",
+                                 f"缺少口型模型权重: {MOUTH_MODEL}")
+            self._queue.clear()
+            self.sig_idle.emit()
+            return
+        while self._queue and not self._stop:
+            name = self._queue.popleft()
+            try:
+                curve = self._process(name, extractor)
+                self.sig_curve.emit(name, curve, CURVE_FPS)
+            except Exception as e:              # 单句失败不拖垮整批
+                self.sig_failed.emit(name, f"{type(e).__name__}: {e}")
+            done += 1
+            self.sig_progress.emit(name, done, done + len(self._queue))
+        if done:
+            self.sig_idle.emit()
+
+    def _process(self, name: str, extractor: MouthCurveExtractor) -> np.ndarray:
+        wav_path = self.project.wav_file(name)
+        x, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)
+        x = x.mean(axis=1) if x.shape[1] > 1 else x[:, 0]
+        curve = extractor.extract(np.ascontiguousarray(x, dtype=np.float32), int(sr))
+        save_curve(self._curve_path(name), curve, CURVE_FPS)
+        return curve

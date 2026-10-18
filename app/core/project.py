@@ -10,7 +10,8 @@
   ├── TextGrid/             # 音素标注
   └── .dsl/                 # DS-Labeler 工作数据
       ├── <句名>.json       # 每句编辑数据（音素/音符）
-      └── f0/<句名>.npz     # F0 缓存（RMVPE 结果）
+      ├── f0/<句名>.npz     # F0 缓存（RMVPE 结果）
+      └── curve/<句名>.npz  # 口型缓存（R3MOE 结果）
   导出数据集时输出 <所选文件夹>/<音色名>/raw/{wavs/*.wav, transcriptions.csv}（见 core/export.py）。
 
 二、翻新工程（旧数据集）：数据目录是**上游流水线的领地**，只读它，绝不往里写任何文件；
@@ -19,7 +20,8 @@
   ├── <工程名>.refurbish.json    # 工程文件（记录数据目录地址 + 语言/进度）
   └── cache/<工程名>/
       ├── <句名>.json            # 每句编辑数据（人工改过的才落盘）
-      └── f0/<句名>.npz          # F0 缓存（RMVPE 结果）
+      ├── f0/<句名>.npz          # F0 缓存（RMVPE 结果）
+      └── curve/<句名>.npz       # 口型缓存（R3MOE 结果）
   音符直接取 csv 的 note_seq/note_dur/note_slur（不做 GAME 推理）。
 
 两类工程的类型由**目录结构**判定（`detect_kind`）：
@@ -43,6 +45,7 @@ PROJECT_FILE = "project.json"
 SETTINGS_FILE = "ds_labeler_settings.json"   # 标准工程侧车（语言/已编辑句/停留句；**不含界面设置**）
 WORK_DIR = ".dsl"
 F0_DIR = "f0"
+CURVE_DIR = "curve"     # 口型（R3MOE）缓存：<工作目录>/curve/<句名>.npz
 
 KIND_STANDARD = "standard"      # 新数据（wav/ + TextGrid/）
 KIND_REFURBISH = "refurbish"    # 翻新旧数据集（transcriptions.csv + wavs/）
@@ -112,14 +115,16 @@ def find_refurbish_project(root: pathlib.Path) -> "Project | None":
 
 DEFAULT_UV_VOCAB = ["AP", "SP", "br", "sil"]
 
-PANE_KEYS = ("wave", "roll", "spec")     # 三面板标识：波形 / 钢琴卷帘 / 频谱
+PANE_KEYS = ("wave", "roll", "curve", "spec")   # 面板标识：波形 / 钢琴卷帘 / 口型 / 频谱
 
-# ---- 配色（音符 / PIT / 两处波形）-----------------------------------------
+# ---- 配色（音符 / PIT / 两处波形 / 口型曲线）-------------------------------
 # 界面颜色的**唯一权威默认值**在这里（views.py 的绘制默认值必须与之一致，回归有断言钉死）。
 # 约定：只存 "#rrggbb" 的 RGB，**alpha 由视图角色固定**——
 #   波形面板 = 不透明(255)、钢琴卷帘波形 = 半透明(150)、
 #   音符填充 = 205 / 描边 = 220（描边由填充色向白混合 0.85 得到）、PIT = 205。
-COLOR_KEYS = ("note_color", "pit_color", "wave_panel_color", "wave_roll_color")
+# 口型曲线是「描边 + 填充」两色。
+BASE_COLOR_KEYS = ("note_color", "pit_color", "wave_panel_color", "wave_roll_color")
+COLOR_KEYS = BASE_COLOR_KEYS + ("curve_line_color", "curve_fill_color")
 
 DEFAULT_COLORS: dict[str, str] = {
     "note_color": "#50beff",        # 普通音符填充（= rgb 80,190,255）
@@ -128,26 +133,33 @@ DEFAULT_COLORS: dict[str, str] = {
     # 钢琴卷帘波形：**深靛蓝**。刻意**不用中性灰白**——灰白与常见音频工具观感撞脸、
     # 辨识度低，故采用更有辨识度的深靛蓝。
     "wave_roll_color": "#4b5e93",   # 钢琴卷帘波形（= rgb 75,94,147）
+    # 口型曲线：亮蓝描边 + 深靛填充。背景不参与自定义——面板背景沿用软件主题色。
+    "curve_line_color": "#7fb3ff",  # 口型曲线描边（= rgb 127,179,255）
+    "curve_fill_color": "#303c5e",  # 口型曲线填充（= rgb 48,60,94）
 }
 
-# 内置配色方案（下拉可选；方案 = 四个颜色的一次性预设）。
+# 内置配色方案（下拉可选；方案 = 一组颜色的一次性预设）。
 # 「经典（默认）」= DEFAULT_COLORS（改默认值即改它）。
 # 注意：音符一律避开绿色系——绿色是「连音(slur)音符」的语义标记色，撞色会分不清。
 COLOR_SCHEMES: dict[str, dict[str, str]] = {
     "经典（默认）": dict(DEFAULT_COLORS),
     "落日暖橙": {"note_color": "#ffa726", "pit_color": "#ff7043",
-                 "wave_panel_color": "#ffca28", "wave_roll_color": "#d8c7ae"},
+                 "wave_panel_color": "#ffca28", "wave_roll_color": "#d8c7ae",
+                 "curve_line_color": "#ff8a4c", "curve_fill_color": "#4d3126"},
     "深海青蓝": {"note_color": "#26c6da", "pit_color": "#ffd54f",
-                 "wave_panel_color": "#4fc3f7", "wave_roll_color": "#a9c3d0"},
+                 "wave_panel_color": "#4fc3f7", "wave_roll_color": "#a9c3d0",
+                 "curve_line_color": "#29b6f6", "curve_fill_color": "#243b4a"},
     "紫罗兰夜": {"note_color": "#9575cd", "pit_color": "#ce93d8",
-                 "wave_panel_color": "#b39ddb", "wave_roll_color": "#c0b6d0"},
+                 "wave_panel_color": "#b39ddb", "wave_roll_color": "#c0b6d0",
+                 "curve_line_color": "#b39ddb", "curve_fill_color": "#3a2f4d"},
     "樱花粉": {"note_color": "#f48fb1", "pit_color": "#ffcc80",
-               "wave_panel_color": "#f8bbd0", "wave_roll_color": "#d8c8cf"},
+               "wave_panel_color": "#f8bbd0", "wave_roll_color": "#d8c8cf",
+               "curve_line_color": "#f06292", "curve_fill_color": "#4a2e3a"},
 }
 
 
 def scheme_of(colors: dict[str, str]) -> str | None:
-    """反查当前四个颜色对应的**内置**方案名（用于打开设置时预选下拉）；自定义则 None。"""
+    """反查当前颜色对应的**内置**方案名（用于打开设置时预选下拉）；自定义则 None。"""
     for name, cols in COLOR_SCHEMES.items():
         if all(str(colors.get(k, "")).lower() == v.lower() for k, v in cols.items()):
             return name
@@ -155,9 +167,11 @@ def scheme_of(colors: dict[str, str]) -> str | None:
 
 
 def clean_presets(raw) -> dict[str, dict[str, str]]:
-    """规范化**自定义配色预设**：{名称: {四个颜色键: #rrggbb}}。
+    """规范化**自定义配色预设**：{名称: {颜色键: #rrggbb}}。
 
-    只保留键齐全、颜色形如 #rrggbb（或 #rgb）的条目；内置方案名不允许占用（避免歧义）。
+    只保留颜色形如 #rrggbb（或 #rgb）的条目；内置方案名不允许占用（避免歧义）。
+    **向后兼容**：老版本预设只存基础四色（note/pit/两处波形）→ 口型两色缺失时补内置
+    默认，保证用户已有的自存预设升级后不丢。基础四色仍需齐全（残缺条目仍被拒）。
     """
     out: dict[str, dict[str, str]] = {}
     if not isinstance(raw, dict):
@@ -168,19 +182,25 @@ def clean_presets(raw) -> dict[str, dict[str, str]]:
         if not isinstance(cols, dict):
             continue
         item = {}
-        for k in COLOR_KEYS:
+        for k in BASE_COLOR_KEYS:
             v = str(cols.get(k) or "").strip()
             if v[:1] == "#" and len(v) in (4, 7):
                 item[k] = v
-        if len(item) == len(COLOR_KEYS):
-            out[name.strip()] = item
+        if len(item) != len(BASE_COLOR_KEYS):
+            continue
+        for k in COLOR_KEYS:                 # 口型两色：有则用，缺则补默认
+            if k in item:
+                continue
+            v = str(cols.get(k) or "").strip()
+            item[k] = v if (v[:1] == "#" and len(v) in (4, 7)) else DEFAULT_COLORS[k]
+        out[name.strip()] = {k: item[k] for k in COLOR_KEYS}
     return out
 
 
 def _clean_panel_order(raw) -> list[str]:
-    """规范化三面板顺序：只留合法键、去重，缺的按默认序补上（保证永远是 3 个键）。"""
+    """规范化面板顺序：只留合法键、去重，缺的按默认序补上（保证永远是 4 个键）。"""
     order = [k for k in (raw or []) if isinstance(k, str) and k in PANE_KEYS]
-    for k in PANE_KEYS:            # 缺的按**默认序**（wave→roll→spec）补在后面
+    for k in PANE_KEYS:            # 缺的按**默认序**（wave→roll→curve→spec）补在后面
         if k not in order:
             order.append(k)
     return order
@@ -198,23 +218,31 @@ class ProjectSettings:
     wave_show: bool = True                # 音符波形：贴在每个音符正下方的波形包络
     wave_panel: bool = False              # 独立波形面板是否显示（波形已进钢琴卷帘 → 默认关掉）
     roll_panel: bool = True               # 钢琴卷帘面板是否显示（显示菜单 / 设置→面板页可关）
-    spec_panel: bool = True               # 频谱面板是否显示（同上；三个面板都可关）
+    curve_panel: bool = False             # 口型面板是否显示（默认关；需 R3MOE 权重在场才有内容）
+    spec_panel: bool = True               # 频谱面板是否显示（同上；四个面板都可关）
     wave_h: float = 120.0                 # 钢琴窗波形上下最大宽度（像素，固定不随缩放变）
     wave_ext_ms: float = 100.0            # 钢琴窗波形每段首尾的横向外扩时长（毫秒，非像素）
     pit_width: float = 1.5                # PIT（F0）音高线粗细（px）：1.0=最细、2.0=最粗
     label_font_size: int = 7              # 钢琴卷帘标签字号（pt）：音符块内 / 词首 / 音素名共用
     # 音符块**内**是否写标签文字（默认关：PIT 曲线会盖住块内文字；词首块外侧那份照旧）
     note_label_inner: bool = False
-    # ---- 配色（音符 / PIT / 两处波形）：存 "#rrggbb"；alpha 由视图角色固定 ----
+    # ---- 配色（音符 / PIT / 两处波形 / 口型曲线）：存 "#rrggbb"；alpha 由视图角色固定 ----
     note_color: str = DEFAULT_COLORS["note_color"]             # 普通音符颜色
     pit_color: str = DEFAULT_COLORS["pit_color"]               # PIT 音高线颜色
     wave_panel_color: str = DEFAULT_COLORS["wave_panel_color"]  # 独立波形面板的波形颜色
     wave_roll_color: str = DEFAULT_COLORS["wave_roll_color"]   # 钢琴卷帘波形的颜色
-    # 用户自存的配色预设 {名称: {四色}}，与内置 COLOR_SCHEMES 一起出现在「配色」页下拉
+    curve_line_color: str = DEFAULT_COLORS["curve_line_color"]  # 口型曲线描边颜色
+    curve_fill_color: str = DEFAULT_COLORS["curve_fill_color"]  # 口型曲线填充颜色
+    # 口型曲线纵轴是否**按当前句峰值自适应**（把该句最大张口顶到面板顶端；关掉则绝对标尺
+    # 0 底 / 1 顶）。默认开——否则大多数句子的曲线都贴在底部一小条，看不出形状。
+    curve_autoscale: bool = True
+    # 用户自存的配色预设 {名称: {各色}}，与内置 COLOR_SCHEMES 一起出现在「配色」页下拉
     color_presets: dict[str, dict[str, str]] = field(default_factory=dict)
-    # 三个面板的上下顺序（"wave"=波形面板 / "roll"=钢琴卷帘 / "spec"=频谱），
-    # 由上到下依次挂载；隐藏的面板（wave_panel / roll_panel / spec_panel 为 False）自动跳过
-    panel_order: list[str] = field(default_factory=lambda: ["wave", "roll", "spec"])
+    # 面板的上下顺序（"wave"=波形面板 / "roll"=钢琴卷帘 / "curve"=口型 / "spec"=频谱），
+    # 由上到下依次挂载；隐藏的面板（wave_panel / roll_panel / curve_panel / spec_panel
+    # 为 False）自动跳过。默认：波形 → 钢琴卷帘 → 口型 → 频谱。
+    panel_order: list[str] = field(
+        default_factory=lambda: ["wave", "roll", "curve", "spec"])
     spectrum_preset: str = "viridis"      # 频谱配色（magma/viridis/gray；默认 viridis）
     # ---- 频谱自定义（窗长按采样率自适应，不暴露）----
     # 默认值为常用的一套
@@ -233,6 +261,7 @@ def settings_to_dict(s: ProjectSettings) -> dict:
         "wave_show": s.wave_show,
         "wave_panel": s.wave_panel,
         "roll_panel": s.roll_panel,
+        "curve_panel": s.curve_panel,
         "spec_panel": s.spec_panel,
         "wave_h": s.wave_h,
         "wave_ext_ms": s.wave_ext_ms,
@@ -243,6 +272,9 @@ def settings_to_dict(s: ProjectSettings) -> dict:
         "pit_color": s.pit_color,
         "wave_panel_color": s.wave_panel_color,
         "wave_roll_color": s.wave_roll_color,
+        "curve_line_color": s.curve_line_color,
+        "curve_fill_color": s.curve_fill_color,
+        "curve_autoscale": s.curve_autoscale,
         "color_presets": {k: dict(v) for k, v in s.color_presets.items()},
         "panel_order": list(s.panel_order),
         "spectrum_preset": s.spectrum_preset,
@@ -264,6 +296,7 @@ def settings_from_dict(st: dict | None) -> ProjectSettings:
         wave_show=bool(st.get("wave_show", d.wave_show)),
         wave_panel=bool(st.get("wave_panel", d.wave_panel)),
         roll_panel=bool(st.get("roll_panel", d.roll_panel)),
+        curve_panel=bool(st.get("curve_panel", d.curve_panel)),
         spec_panel=bool(st.get("spec_panel", d.spec_panel)),
         wave_h=float(st.get("wave_h", d.wave_h) or d.wave_h),
         wave_ext_ms=float(st.get("wave_ext_ms", d.wave_ext_ms)),
@@ -274,6 +307,9 @@ def settings_from_dict(st: dict | None) -> ProjectSettings:
         pit_color=str(st.get("pit_color") or d.pit_color),
         wave_panel_color=str(st.get("wave_panel_color") or d.wave_panel_color),
         wave_roll_color=str(st.get("wave_roll_color") or d.wave_roll_color),
+        curve_line_color=str(st.get("curve_line_color") or d.curve_line_color),
+        curve_fill_color=str(st.get("curve_fill_color") or d.curve_fill_color),
+        curve_autoscale=bool(st.get("curve_autoscale", d.curve_autoscale)),
         color_presets=clean_presets(st.get("color_presets")),
         panel_order=_clean_panel_order(st.get("panel_order")),
         spectrum_preset=st.get("spectrum_preset") or d.spectrum_preset,
@@ -386,6 +422,11 @@ class Project:
     @property
     def f0_dir(self) -> pathlib.Path:
         return self.work_dir / F0_DIR
+
+    @property
+    def curve_dir(self) -> pathlib.Path:
+        """口型（R3MOE）缓存目录：标准工程 `<根>/.dsl/curve/`，翻新 `<软件根>/refurbish/cache/<名>/curve/`。"""
+        return self.work_dir / CURVE_DIR
 
     def wav_file(self, name: str) -> pathlib.Path:
         return self.wav_dir / f"{name}.wav"

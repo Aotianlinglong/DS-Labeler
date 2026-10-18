@@ -26,6 +26,14 @@ Copyright 2026 Aotianlinglong · <https://github.com/Aotianlinglong/DS-Labeler>
 - 权重下载：<https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.onnx>
 - 许可：见上游项目与模型分发页
 
+### R3MOE —— 口型（开口度）曲线提取
+- 项目：<https://github.com/KakaruHayate/R3MOE>（KakaruHayate）
+- **许可：MPL-2.0**（Mozilla Public License 2.0）
+- 说明：本软件使用其导出的 ONNX 模型（默认文件名 `opec.onnx`）计算「口型面板」的开口度曲线。
+  上游只发布训练工程与导出脚本，**ONNX 需自行导出**；本仓库**不打包其权重，也未包含其源代码**，
+  只在运行时通过 ONNX Runtime 调用。输入为 44.1 kHz 单声道波形，输出为 50 帧 / 秒的归一化开口度。
+- 该权重**可缺**：缺失时口型面板无内容，其余功能不受影响。
+
 ### ONNX Runtime
 - 项目：<https://github.com/microsoft/onnxruntime>（Microsoft），许可 MIT
 - Windows 下使用 `onnxruntime-directml` 走 DirectML（DX12）GPU 推理

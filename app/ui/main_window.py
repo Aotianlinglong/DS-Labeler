@@ -4,7 +4,7 @@
   菜单栏（工程：新建/打开/最近/保存/导出/回写 ＋ 编辑 ＋ 工具 ＋ 视图 ＋ 设置 ＋ 帮助）
   （工具栏已整条去掉：撤销重做在编辑菜单、推理与批量替换在工具菜单、配色在视图→频谱配色）
   + 顶部层信息栏：显示当前句、时长、选中音素/音符的详细信息
-  + 左侧句子列表 │ 右侧三面板 QSplitter（波形 / mel 频谱 / 钢琴卷帘，均可拖拽调整）
+  + 左侧句子列表 │ 右侧多面板 QSplitter（波形 / 钢琴卷帘 / 口型 / mel 频谱，均可拖拽调整）
 """
 from __future__ import annotations
 
@@ -21,9 +21,10 @@ from PySide6.QtWidgets import (
 )
 
 from core.csv_io import write_csv
+from core.curve import FPS as CURVE_FPS, MouthCurveExtractor, load_curve, save_curve
 from core.edit import EditModel, note_labels, sync_word_marks, word_phone_counts, word_phone_groups
 from core.export import ExportValidationError, export_dataset, unknown_report
-from core.paths import lang_dict
+from core.paths import MOUTH_MODEL, lang_dict
 from core.phonemes import LANGS
 from core.project import (
     DEFAULT_COLORS, KIND_REFURBISH, PANE_KEYS, PROJECT_FILE, REFURBISH_SUFFIX, Project,
@@ -35,22 +36,25 @@ from core.textgrid_io import parse_textgrid, tier_items
 from engine.f0 import load_f0
 from ui.audio import AudioEngine
 from ui.settings_dialog import SettingsDialog
-from ui.views import SpectroRollView, TierBar, ViewState, WaveformView
-from ui.worker import InferenceWorker
+from ui.views import CurveCanvas, SpectroRollView, TierBar, ViewState, WaveformView
+from ui.worker import InferenceWorker, MouthCurveWorker
 
-BUILD = "2026.10.18"    # 版本指纹（标题栏可见；改动未生效时先核对这个）
+BUILD = "2026.10.19-r50"    # 版本指纹（标题栏可见；改动未生效时先核对这个）
 
 RECENT_MAX = 12
 
 _EXPORT_AUDIO_DIR = "wavs"   # 数据集里音频子目录名（与既有数据集/上游 build_dataset 一致）
 
-# 三面板显隐：面板 key → 软件级设置字段 / 界面标题（「显示」菜单与 设置→「面板」页共用）
-_PANEL_ATTR = {"wave": "wave_panel", "roll": "roll_panel", "spec": "spec_panel"}
-_PANEL_TITLE = {"wave": "波形面板", "roll": "钢琴卷帘", "spec": "频谱窗"}
+# 面板显隐：面板 key → 软件级设置字段 / 界面标题（「显示」菜单与 设置→「面板」页共用）
+_PANEL_ATTR = {"wave": "wave_panel", "roll": "roll_panel",
+               "curve": "curve_panel", "spec": "spec_panel"}
+_PANEL_TITLE = {"wave": "波形面板", "roll": "钢琴卷帘",
+                "curve": "口型面板", "spec": "频谱窗"}
 
 
 def _panel_visibility(st) -> dict[str, bool]:
-    """三面板显隐（**软件级**设置：wave_panel / roll_panel / spec_panel）；无设置时全开。"""
+    """面板显隐（**软件级**设置：wave_panel / roll_panel / curve_panel / spec_panel）；
+    无设置时全开。"""
     if st is None:
         return {k: True for k in _PANEL_ATTR}
     return {k: bool(getattr(st, attr, True)) for k, attr in _PANEL_ATTR.items()}
@@ -74,6 +78,9 @@ class MainWindow(QMainWindow):
         self.spec: SpecData | None = None
         self._samples = None                     # 当前句采样（改频谱设置时重算用）
         self._sr: int = 0
+        self._mouth: MouthCurveExtractor | None = None   # R3MOE 口型提取器（懒加载）
+        self._curve: np.ndarray | None = None            # 当前句口型曲线（缓存/现算）
+        self.mouth_worker: MouthCurveWorker | None = None  # 批量计算口型的后台线程
         self.tg: SentenceData | None = None      # 源 TextGrid（texts/words/phones 三层参照）
         self._sentences: list[str] = []
         self._current: str = ""
@@ -104,6 +111,7 @@ class MainWindow(QMainWindow):
         self._apply_panes()
         self._apply_wave_metrics()
         self._apply_colors()
+        self._apply_curve_options()
         self._apply_kind()             # 无工程时：层信息条按标准 3 行，导出/回写项置灰
         self._restore_layout()
 
@@ -155,24 +163,28 @@ class MainWindow(QMainWindow):
         self.tier_bar.sig_changed.connect(self._on_edited)      # words/texts 编辑完成
         rv.addWidget(self.tier_bar)
 
-        # 顺序：层信息栏（上）→ 波形（中）→ 钢琴卷帘 → 频谱窗（下，可拉小）
-        # 钢琴窗与频谱窗已拆成两个独立面板：共用同一 ViewState（同一浮点时间映射），
-        # 所以时间轴仍逐像素对齐；频谱窗能拉小（小一点反而更好看清谐波）。
+        # 顺序：层信息栏（上）→ 波形（中）→ 钢琴卷帘 → 口型 → 频谱窗（下，可拉小）
+        # 各面板共用同一 ViewState（同一浮点时间映射），所以时间轴逐像素对齐；
+        # 挂载顺序与显隐由设置决定（panel_order + *_panel），由 _apply_panes 负责。
         self.panes = QSplitter(Qt.Vertical)
         self.view = SpectroRollView(self.state, layers=("notes",))       # 钢琴卷帘
         self.spec_view = SpectroRollView(self.state, layers=("spec",))   # mel 频谱窗
         self.wave = WaveformView(self.state)
-        for v in (self.view, self.spec_view, self.wave):
+        self.curve = CurveCanvas(self.state)                             # 口型（R3MOE 开口度）
+        for v in (self.view, self.spec_view, self.wave, self.curve):
             v.sig_play_toggle.connect(self._toggle_play)
             v.sig_play_phoneme.connect(self._play_phoneme)
             v.sig_changed.connect(self._on_edited)
             v.sig_status.connect(lambda s: self.statusBar().showMessage(s))
             v.sig_selection.connect(self._on_view_selection)
             v.sig_viewport.connect(self._sync_viewport)
-        self.panes.addWidget(self.wave)
-        self.panes.addWidget(self.view)
-        self.panes.addWidget(self.spec_view)
-        self.panes.setSizes([200, 400, 240])
+            v.sig_cursor.connect(self._on_cursor_moved)   # 光标竖直虚线跨面板同步
+        for k, w in (("wave", self.wave), ("roll", self.view),
+                     ("curve", self.curve), ("spec", self.spec_view)):
+            if self.app_settings and bool(getattr(self.app_settings,
+                                                  _PANEL_ATTR[k], True)):
+                self.panes.addWidget(w)
+        self.panes.setSizes([160, 360, 160, 240])
         self.panes.setChildrenCollapsible(False)
         rv.addWidget(self.panes, 1)
         main_split.addWidget(right)
@@ -245,6 +257,11 @@ class MainWindow(QMainWindow):
         a_replace = QAction("批量替换音素…", self)
         a_replace.triggered.connect(self._batch_replace)
         m_tool.addAction(a_replace)
+        m_tool.addSeparator()
+        # 口型（R3MOE）：后台批量算出全部句的口型并缓存（切句时按需计算之外的批量入口）
+        self.act_batch_mouth = QAction("计算所有文件口型", self)
+        self.act_batch_mouth.triggered.connect(self._batch_mouth)
+        m_tool.addAction(self.act_batch_mouth)
 
         m_view = mb.addMenu("视图(&V)")
         a_fit = QAction("适配全曲", self)
@@ -258,7 +275,7 @@ class MainWindow(QMainWindow):
         a_zout.triggered.connect(lambda: self._zoom(1 / 1.3))
         m_view.addAction(a_zout)
         m_view.addSeparator()
-        a_eq = QAction("三面板均分", self)
+        a_eq = QAction("面板均分", self)
         a_eq.triggered.connect(self._reset_panes)
         m_view.addAction(a_eq)
         m_view.addSeparator()
@@ -278,7 +295,7 @@ class MainWindow(QMainWindow):
             m_cmap.addAction(act)
         self._cmap_group.actions()[0].setChecked(True)
 
-        # 「显示」菜单：三个面板的显隐（软件级设置，与 设置→「面板」页同一份）
+        # 「显示」菜单：各面板的显隐 + 口型纵轴（软件级设置，与 设置→「面板」页同一份）
         m_disp = mb.addMenu("显示(&D)")
         self.act_wave_panel = QAction("波形面板", self)
         self.act_wave_panel.setCheckable(True)
@@ -289,11 +306,22 @@ class MainWindow(QMainWindow):
         self.act_roll_panel.triggered.connect(
             lambda c: self._on_panel_visibility("roll", c))
         m_disp.addAction(self.act_roll_panel)
+        self.act_curve_panel = QAction("口型面板", self)
+        self.act_curve_panel.setCheckable(True)
+        self.act_curve_panel.triggered.connect(
+            lambda c: self._on_panel_visibility("curve", c))
+        m_disp.addAction(self.act_curve_panel)
         self.act_spec_panel = QAction("频谱窗", self)
         self.act_spec_panel.setCheckable(True)
         self.act_spec_panel.triggered.connect(
             lambda c: self._on_panel_visibility("spec", c))
         m_disp.addAction(self.act_spec_panel)
+        m_disp.addSeparator()
+        # 口型面板的纵轴标尺（显示菜单里给个快捷开关，等价于 设置→「面板」页里那一项）
+        self.act_curve_fit = QAction("口型按峰值自适应高度", self)
+        self.act_curve_fit.setCheckable(True)
+        self.act_curve_fit.triggered.connect(self._on_curve_autoscale)
+        m_disp.addAction(self.act_curve_fit)
 
         m_set = mb.addMenu("设置(&S)")
         a_set = QAction("设置…", self)
@@ -507,13 +535,14 @@ class MainWindow(QMainWindow):
         # 于是各处的 project.settings / project.save() 都自然写向 app_settings.json
         proj.settings = self.app_settings
         proj.layout = self.app_layout
-        for v in (self.view, self.spec_view, self.wave):
+        for v in (self.view, self.spec_view, self.wave, self.curve):
             v.set_model(None)
         for v in (self.view, self.spec_view):
             v.set_spec(None)
         self.view.set_f0(None)
         self.wave.set_audio(None, 44100)
         self.view.set_audio(None, 44100)
+        self._set_curve(None)
         self.editor = None
         self.spec = None
         self.tg = None
@@ -525,6 +554,7 @@ class MainWindow(QMainWindow):
         self._apply_panes()            # 按 panel_order 挂载面板 + 波形面板显隐
         self._apply_wave_metrics()     # 钢琴窗波形上下宽度 / 段落外扩时长 / PIT 线粗细
         self._apply_colors()           # 音符 / PIT / 两处波形的颜色
+        self._apply_curve_options()    # 口型纵轴自适应
         self._apply_kind()             # 层信息条行数 + 导出/回写项启用态（按工程类型）
         self._restore_layout()         # 恢复上次关闭时的面板长宽 / 钢琴窗纵高
         # 音符标签器（惯例：前面的辅音 + 当前的元音）
@@ -559,6 +589,7 @@ class MainWindow(QMainWindow):
         self._sync_panel_actions()
         self._apply_wave_metrics()          # 波形宽度 / 外扩时长 / PIT 线粗细
         self._apply_colors()               # 音符 / PIT / 两处波形的颜色
+        self._apply_curve_options()        # 口型纵轴自适应
         for act in self._cmap_group.actions():   # 视图→频谱配色 的勾选态跟着当前配色走
             if act.data() == cmap:
                 act.setChecked(True)
@@ -582,6 +613,7 @@ class MainWindow(QMainWindow):
         self._sync_panel_actions()
         self._apply_wave_metrics()                  # 波形宽度 / 外扩时长 / PIT 线粗细
         self._apply_colors()                        # 音符 / PIT / 两处波形颜色立即生效
+        self._apply_curve_options()                 # 口型纵轴自适应立即生效
         self._set_cmap(st.spectrum_preset)          # 同步工具栏/视图菜单配色
         if self._samples is not None and self._sr:
             self.spec = self._compute_spec(self._samples, self._sr)
@@ -609,21 +641,25 @@ class MainWindow(QMainWindow):
             v.set_label_font(st.label_font_size)
 
     def _apply_colors(self):
-        """把**软件级**设置里的「音符 / PIT / 两处波形」颜色推给三个视图（设置→「配色」页）。
+        """把**软件级**设置里的「音符 / PIT / 两处波形 / 口型两色」颜色推给各视图
+        （设置→「配色」页）。
 
-        三个视图都推：波形面板看 wave_panel_color、钢琴卷帘看 wave_roll_color，
-        音符 / PIT 只有钢琴卷帘画（推给频谱窗无副作用，保持状态一致）。
+        三个波形视图都推：波形面板看 wave_panel_color、钢琴卷帘看 wave_roll_color，
+        音符 / PIT 只有钢琴卷帘画（推给频谱窗无副作用，保持状态一致）；口型两色推给口型画布。
         """
         st = self.app_settings
         note = st.note_color if st is not None else DEFAULT_COLORS["note_color"]
         pit = st.pit_color if st is not None else DEFAULT_COLORS["pit_color"]
         wp = st.wave_panel_color if st is not None else DEFAULT_COLORS["wave_panel_color"]
         wr = st.wave_roll_color if st is not None else DEFAULT_COLORS["wave_roll_color"]
+        cl = st.curve_line_color if st is not None else DEFAULT_COLORS["curve_line_color"]
+        cf = st.curve_fill_color if st is not None else DEFAULT_COLORS["curve_fill_color"]
         self.wave.set_wave_color(wp)
         for v in (self.view, self.spec_view):
             v.set_wave_color(wr)
             v.set_note_colors(note)
             v.set_pit_color(pit)
+        self.curve.set_curve_colors(cl, cf)
 
     def _refresh_language_state(self):
         """语言表/音素系统/全局音素/主语言变化后：重建分类器与音符标签。"""
@@ -725,6 +761,22 @@ class MainWindow(QMainWindow):
         # 打开工程即预建 ONNX 会话（+跑一次哑推理），把首次 3s 的建会话开销
         # 挪到用户看界面的空闲时间，第一句直接按稳态速度跑。
         self.worker.warmup()
+        self._bind_mouth_worker()
+
+    def _bind_mouth_worker(self):
+        """口型线程（QThread 本体很轻，会话/缓存只在实际 enqueue 后才有开销）。
+
+        真正的懒加载在 `MouthCurveWorker.run()`（权重缺失即退出）；且只有口型面板**可见**
+        时主窗口才会 enqueue → 默认关面板不产生任何口型计算。
+        """
+        if self.mouth_worker is None:
+            self.mouth_worker = MouthCurveWorker(self.project, self)
+            self.mouth_worker.sig_progress.connect(self._on_mouth_progress)
+            self.mouth_worker.sig_curve.connect(self._on_curve_ready)
+            self.mouth_worker.sig_failed.connect(self._on_mouth_failed)
+            self.mouth_worker.sig_idle.connect(self._on_mouth_idle)
+        else:
+            self.mouth_worker.set_project(self.project)
 
     def _is_ready(self, name: str) -> bool:
         f0 = (self.project.f0_dir / f"{name}.npz").exists()
@@ -791,10 +843,11 @@ class MainWindow(QMainWindow):
             self._seed_tiers(data)              # words/texts 层：源 TG 播种（标准工程）
             self.editor = EditModel(data)
             sync_word_marks(self.editor)        # word 名：音素集合变了才改写，否则保留源标记
-            for v in (self.view, self.spec_view, self.wave):
+            for v in (self.view, self.spec_view, self.wave, self.curve):
                 v.set_model(self.editor)
             self.tier_bar.set_model(self.editor)
             self._load_f0(name)
+            self._load_curve(name)
             self._update_label()
             self.audio.stop()
             self._timer.start()
@@ -817,6 +870,82 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._log(f"频谱计算失败: {e}")
             return None
+
+    # ================= 口型（R3MOE）=================
+    def _curve_visible(self) -> bool:
+        return bool(self.app_settings and self.app_settings.curve_panel)
+
+    def _curve_path(self, name: str):
+        return self.project.curve_dir / f"{name}.npz"
+
+    def _set_curve(self, curve, fps: float = CURVE_FPS) -> None:
+        self._curve = curve
+        self.curve.set_curve(curve, fps)
+
+    def _load_curve(self, name: str) -> None:
+        """切句：缓存命中直接用；缺缓存且口型面板可见 → 交给后台现算并写缓存。
+
+        面板默认关 → 不打扰（不开面板不算口型）。
+        """
+        self._set_curve(None)
+        if self.project is None:
+            return
+        path = self._curve_path(name)
+        if path.exists():
+            try:
+                c, fps = load_curve(path)
+                self._set_curve(c, fps)
+                return
+            except Exception as e:
+                self._log(f"口型缓存损坏 {name}: {e}（将重算）")
+        if not self._curve_visible():
+            return
+        self._enqueue_mouth([name], front=True)
+
+    def _enqueue_mouth(self, names, front: bool = False) -> int:
+        if self.project is None:
+            return 0
+        if self.mouth_worker is None:
+            self._bind_mouth_worker()
+        if self.mouth_worker is None:      # 绑定被禁用（异常）→ 静默跳过
+            return 0
+        n = self.mouth_worker.enqueue(names, front=front)
+        if n:
+            self.statusBar().showMessage(f"正在计算口型（{n} 句）…")
+        return n
+
+    def _on_mouth_progress(self, name: str, done: int, total: int):
+        self.statusBar().showMessage(f"计算口型 {name}（{done}/{total}）")
+
+    def _on_curve_ready(self, name: str, curve, fps: float):
+        if name == self._current:
+            self._set_curve(curve, fps)
+
+    def _on_mouth_failed(self, name: str, err: str):
+        self._log(f"口型计算失败 {name}: {err}")
+        self.statusBar().showMessage(f"口型计算失败：{err}", 6000)
+
+    def _on_mouth_idle(self):
+        self.statusBar().showMessage("口型计算完成", 5000)
+        self._log("口型计算完成")
+
+    def _batch_mouth(self):
+        """菜单「计算所有文件口型」：后台批量算出全部句的口型并缓存（进度到状态栏）。"""
+        if self.project is None or not self._sentences:
+            self.statusBar().showMessage("没有打开工程，无法计算口型", 4000)
+            return
+        if not MOUTH_MODEL.exists():
+            QMessageBox.information(
+                self, "缺少口型模型",
+                "未找到口型模型权重：\n"
+                f"{MOUTH_MODEL}\n\n"
+                "R3MOE 权重（opec.onnx）需自行从上游项目获取后放到该路径：\n"
+                "https://github.com/KakaruHayate/R3MOE\n"
+                "（本软件不打包该权重；详见 README「模型放置」一节）")
+            return
+        n = self._enqueue_mouth(self._sentences)
+        self.statusBar().showMessage(
+            f"已加入口型计算队列：{n} 句" if n else "所有句的口型缓存都已存在")
 
     def _read_work(self, name: str) -> SentenceData | None:
         path = self.project.sentence_work_file(name)
@@ -966,7 +1095,7 @@ class MainWindow(QMainWindow):
             item.setForeground(Qt.gray)
 
     def _refresh_views(self):
-        for v in (self.view, self.spec_view, self.wave):
+        for v in (self.view, self.spec_view, self.wave, self.curve):
             v.update()
 
     def _undo(self):
@@ -1015,16 +1144,31 @@ class MainWindow(QMainWindow):
         注意：必须重读 phones 数据（不能只 update 重绘），否则拖动过程中
         层信息条会停留在旧边界上 —— 表现为「松手后才同步」。
         """
-        for v in (self.view, self.spec_view, self.wave):
+        for v in (self.view, self.spec_view, self.wave, self.curve):
             v.update()
         self._update_tier_bar()
+
+    def _on_cursor_moved(self, t: float):
+        """任一面板的鼠标光标时间变化 → 广播给所有面板，让竖直虚线落在同一竖线上。
+
+        只重绘时间真的变了的面板（发信者自身值未变，不重复重绘）。
+        """
+        for v in (self.view, self.spec_view, self.wave, self.curve):
+            v._apply_cursor_t(t)
 
     def _reset_panes(self):
         h = max(3, self.panes.height())
         n = self.panes.count()
-        if n == 0:                      # 三个面板全关：没有面板可分配高度
+        if n == 0:                      # 全部面板都关：没有面板可分配高度
             return
-        if n >= 3:
+        if n >= 4:
+            # 四面板（含口型）：按面板角色分权重，波形/口型窄、钢琴卷帘宽
+            wmap = {"wave": 0.16, "roll": 0.42, "curve": 0.19, "spec": 0.23}
+            vis = _panel_visibility(self.app_settings)
+            order = list(self.app_settings.panel_order) if self.app_settings else list(PANE_KEYS)
+            self.panes.setSizes([max(1, int(h * wmap[k]))
+                                 for k in order if k in wmap and vis[k]])
+        elif n == 3:
             # 三面板默认按「波形窄 / 钢琴卷帘宽 / 频谱可拉小」分配
             self.panes.setSizes([int(h * 0.22), int(h * 0.50), int(h * 0.28)])
         elif n == 2:
@@ -1049,17 +1193,21 @@ class MainWindow(QMainWindow):
         self._on_panel_visibility("wave", checked)
 
     def _on_panel_visibility(self, key: str, checked: bool):
-        """三面板显隐开关（「显示」菜单与 设置→「面板」页同一份**软件级**设置）。
+        """各面板显隐开关（「显示」菜单与 设置→「面板」页同一份**软件级**设置）。
 
         只把面板按新顺序重新挂进 / 摘出 QSplitter（不重建 widget），
         故已加载的频谱 / 音符 / 播放头都保留、时间轴也不变。
         """
+        was = bool(getattr(self.app_settings, _PANEL_ATTR[key], True))
         setattr(self.app_settings, _PANEL_ATTR[key], bool(checked))   # 无工程也记住
         try:
             save_app_settings(self.app_settings, self.app_layout)
         except Exception:
             pass
         self._apply_panes()
+        # 刚打开口型面板且当前句还没缓存 → 立即补算当前句
+        if key == "curve" and checked and not was and self._current:
+            self._load_curve(self._current)
         self.statusBar().showMessage(
             f"{_PANEL_TITLE[key]}已{'显示' if checked else '隐藏'}", 4000)
 
@@ -1067,22 +1215,42 @@ class MainWindow(QMainWindow):
         """「显示」菜单勾选态跟着**软件级**设置走（启动即生效，无工程也同步）。"""
         st = self.app_settings
         for k, act in (("wave", self.act_wave_panel), ("roll", self.act_roll_panel),
-                       ("spec", self.act_spec_panel)):
+                       ("curve", self.act_curve_panel), ("spec", self.act_spec_panel)):
             act.setChecked(bool(getattr(st, _PANEL_ATTR[k], True)))
+        self.act_curve_fit.setChecked(bool(getattr(st, "curve_autoscale", True)))
+
+    def _on_curve_autoscale(self, checked: bool):
+        """「显示 → 口型按峰值自适应高度」：与 设置→「面板」页里那一项是同一份设置。"""
+        self.app_settings.curve_autoscale = bool(checked)
+        try:
+            save_app_settings(self.app_settings, self.app_layout)
+        except Exception:
+            pass
+        self.curve.set_autoscale(checked)
+        self.statusBar().showMessage(
+            "口型纵轴：按当前句峰值自适应高度" if checked
+            else "口型纵轴：绝对标尺（0 = 闭嘴 / 1 = 最大张口）", 4000)
+
+    def _apply_curve_options(self):
+        """把**软件级**设置里口型面板的显示选项（纵轴自适应）推给口型画布。"""
+        st = self.app_settings
+        self.curve.set_autoscale(bool(st.curve_autoscale) if st is not None else True)
 
     def _apply_panes(self):
-        """按设置的**上下顺序**重建三个面板的挂载（默认 波形 → 钢琴卷帘 → 频谱）。
+        """按设置的**上下顺序**重建面板的挂载（默认 波形 → 钢琴卷帘 → 口型 → 频谱）。
 
         - 顺序来自 ProjectSettings.panel_order（设置 →「面板」页可自由调整，由上到下）；
-        - 三个面板各有显隐开关（wave_panel / roll_panel / spec_panel，「显示」菜单同源），
-          关掉的面板自动从顺序里跳过；三个全关时面板区为空（都要能关，不做强制兜底）；
+        - 各面板都有显隐开关（wave_panel / roll_panel / curve_panel / spec_panel，
+          「显示」菜单同源），关掉的面板自动从顺序里跳过；全关时面板区为空
+          （都要能关，不做强制兜底）；
         - 不重建 widget：只把面板按新顺序挂回 / 摘出 QSplitter（摘除用 setParent(None)），
           所以已加载的 spec / model / f0 / 播放头都保留，时间轴也不变。
         """
         st = self.app_settings                      # 软件级设置（无工程也生效）
         order = list(st.panel_order) if st is not None else list(PANE_KEYS)
         vis = _panel_visibility(st)
-        widgets = {"wave": self.wave, "roll": self.view, "spec": self.spec_view}
+        widgets = {"wave": self.wave, "roll": self.view,
+                   "curve": self.curve, "spec": self.spec_view}
         shown = [k for k in order if k in widgets and vis[k]]
         # 先全部摘下，再按新顺序挂回（addWidget 只会追加，顺序不对会导致面板错位）
         for w in widgets.values():
@@ -1090,9 +1258,8 @@ class MainWindow(QMainWindow):
                 w.setParent(None)
         for k in shown:
             self.panes.addWidget(widgets[k])
-        self.wave.setVisible("wave" in shown)
-        self.view.setVisible("roll" in shown)
-        self.spec_view.setVisible("spec" in shown)
+        for k, w in widgets.items():
+            w.setVisible(k in shown)
         self._reset_panes()
         self._refresh_views()
         self._sync_viewport()
@@ -1149,7 +1316,7 @@ class MainWindow(QMainWindow):
         if self.editor is not None and (self.editor.dirty or self.editor.notes):
             return
         self.editor = EditModel(data)
-        for v in (self.view, self.spec_view, self.wave):
+        for v in (self.view, self.spec_view, self.wave, self.curve):
             v.set_model(self.editor)
         self._load_f0(name)
         self._update_label()
@@ -1223,7 +1390,7 @@ class MainWindow(QMainWindow):
                 changed += n
                 data.save(self.project.sentence_work_file(name))
         if not whole and self.editor is not None and self._current:
-            for v in (self.view, self.spec_view, self.wave):
+            for v in (self.view, self.spec_view, self.wave, self.curve):
                 v.set_model(self.editor)
         self._log(f"批量替换音素 {old} → {new}：共 {changed} 处")
         QMessageBox.information(self, "完成", f"共替换 {changed} 处。")
@@ -1419,7 +1586,7 @@ class MainWindow(QMainWindow):
         """右键播放所点音素：只播 [start, end)，播放头定位到起点。"""
         self.audio.stop()
         self.audio.play_range(t0, t1)
-        for v in (self.view, self.spec_view, self.wave):
+        for v in (self.view, self.spec_view, self.wave, self.curve):
             v.set_play_pos(t0)
         self._timer.start()
 
@@ -1427,7 +1594,7 @@ class MainWindow(QMainWindow):
         pos = self.audio.current_pos()
         if pos < 0:
             return      # 停止后保留播放头在最后位置（播放指针必须一直可见）
-        for v in (self.view, self.spec_view, self.wave):
+        for v in (self.view, self.spec_view, self.wave, self.curve):
             v.set_play_pos(pos)
 
     # ================= 日志 =================
@@ -1460,4 +1627,7 @@ class MainWindow(QMainWindow):
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait(15000)     # 预热/建会话可能正在跑（不可中断）：给足时间再析构 QThread
+        if self.mouth_worker is not None:
+            self.mouth_worker.stop()
+            self.mouth_worker.wait(15000)   # 同上：口型推理不可中断，等它收尾
         super().closeEvent(event)

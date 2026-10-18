@@ -6,8 +6,8 @@
   ├ 语言    →   主语言（**跟随工程**）+ 全局无声音素（自定义词典/元辅音/音素系统已移除）
   ├ 频谱    →   窗函数 / 频率轴(mel·线性·对数) / FFT 间隔 / 最大频率 / 分辨率 / dB / 配色
   ├ 波形    →   钢琴窗波形的上下最大宽度 / 每段外扩时长 / PIT 音高线粗细
-  ├ 面板    →   三个面板（波形 / 钢琴卷帘 / 频谱）的上下顺序 + 波形面板显隐
-  └ 配色    →   音符 / PIT / 两处波形的颜色 + 配色方案（内置 + 自存预设）
+  ├ 面板    →   四个面板（波形 / 钢琴卷帘 / 口型 / 频谱）的上下顺序 + 各自显隐 + 口型纵轴
+  └ 配色    →   音符 / PIT / 两处波形 / 口型两色的颜色 + 配色方案（内置 + 自存预设）
 
 **归属**：
   · 主语言与全局无声音素 → **工程**（随 `project.save()` 落 ds_labeler_settings.json）；
@@ -255,9 +255,9 @@ class WavePage(QWidget):
 
 
 class PanelPage(QWidget):
-    """三个面板（波形 / 钢琴卷帘 / 频谱）的上下顺序 + 三个面板各自的显隐 + 标签字号。"""
+    """面板（波形 / 钢琴卷帘 / 口型 / 频谱）的上下顺序 + 各自显隐 + 标签字号。"""
 
-    LABELS = {"wave": "波形面板", "roll": "钢琴卷帘", "spec": "频谱"}
+    LABELS = {"wave": "波形面板", "roll": "钢琴卷帘", "curve": "口型面板", "spec": "频谱"}
 
     def __init__(self, settings: ProjectSettings, parent=None):
         super().__init__(parent)
@@ -290,9 +290,17 @@ class PanelPage(QWidget):
         self.chk_roll = QCheckBox("显示钢琴卷帘")
         self.chk_roll.setChecked(bool(st.roll_panel))
         root.addWidget(self.chk_roll)
+        self.chk_curve = QCheckBox("显示口型面板（R3MOE 开口度曲线；需自备模型权重）")
+        self.chk_curve.setChecked(bool(st.curve_panel))
+        root.addWidget(self.chk_curve)
         self.chk_spec = QCheckBox("显示频谱窗")
         self.chk_spec.setChecked(bool(st.spec_panel))
         root.addWidget(self.chk_spec)
+
+        self.chk_fit = QCheckBox("口型曲线按当前句峰值自适应高度"
+                                 "（把该句最大张口顶到面板顶端；关掉＝绝对标尺 0…1）")
+        self.chk_fit.setChecked(bool(st.curve_autoscale))
+        root.addWidget(self.chk_fit)
 
         frow = QHBoxLayout()
         frow.addWidget(QLabel("标签字号"))
@@ -311,7 +319,12 @@ class PanelPage(QWidget):
 
         tip = QLabel("顺序立即生效：切面板只是把面板按新顺序重新挂进分隔条，"
                      "不会重载频谱 / 音符 / 播放头，时间轴也保持不变。\n"
-                     "三个面板都可关闭（隐藏后自动从顺序里跳过，与「显示」菜单同一份设置）。\n"
+                     "各面板都可关闭（隐藏后自动从顺序里跳过，与「显示」菜单同一份设置）。\n"
+                     "口型面板默认关闭；打开后会按「切到该句时计算并缓存」，"
+                     "也可用菜单「工具 → 计算所有文件口型」一次性算完全部句。\n"
+                     "「按峰值自适应」＝纵轴满量程取当前句开口度最大值（面板左侧标出峰值），"
+                     "关掉则按绝对标尺 0（闭嘴）… 1（最大张口）——跨句比较张口幅度时用后者；"
+                     "该项也可在「显示」菜单里随手切换（同一份设置）。\n"
                      "音素标签始终写在词首音符的块外上方，所以关掉块内文字不丢信息。")
         tip.setWordWrap(True)
         root.addWidget(tip)
@@ -333,18 +346,22 @@ class PanelPage(QWidget):
         settings.panel_order = self.order()
         settings.wave_panel = bool(self.chk_wave.isChecked())
         settings.roll_panel = bool(self.chk_roll.isChecked())
+        settings.curve_panel = bool(self.chk_curve.isChecked())
         settings.spec_panel = bool(self.chk_spec.isChecked())
+        settings.curve_autoscale = bool(self.chk_fit.isChecked())
         settings.label_font_size = int(self.sp_font.value())
         settings.note_label_inner = bool(self.chk_inner.isChecked())
 
 
 class PalettePage(QWidget):
-    """配色：音符 / PIT / 两处波形的颜色 + 配色方案（内置 + 用户自存预设）。"""
+    """配色：音符 / PIT / 两处波形 / 口型曲线的颜色 + 配色方案（内置 + 用户自存预设）。"""
 
     ROWS = (("note_color", "音符颜色"),
             ("pit_color", "PIT 音高线颜色"),
             ("wave_panel_color", "波形面板波形颜色"),
-            ("wave_roll_color", "钢琴卷帘波形颜色"))
+            ("wave_roll_color", "钢琴卷帘波形颜色"),
+            ("curve_line_color", "口型曲线描边颜色"),
+            ("curve_fill_color", "口型曲线填充颜色"))
 
     def __init__(self, settings: ProjectSettings, parent=None):
         super().__init__(parent)
@@ -397,12 +414,13 @@ class PalettePage(QWidget):
         self._refresh_swatches()
         self._mark_scheme()                                   # 打开时按当前颜色预选方案
 
-        tip = QLabel("四个颜色改完点「确定」立即生效（不需要重开工程）；"
-                     "颜色写进 project.json 的 settings 段，自存预设也一起存在那里。\n"
-                     "「存为预设…」把当前四色存成一个命名的方案（可跨次打开复用、可删除）；"
+        tip = QLabel("颜色改完点「确定」立即生效（不需要重开工程）；"
+                     "颜色是**软件级**设置（写软件根目录 app_settings.json，换工程不丢）。\n"
+                     "「存为预设…」把当前全部颜色存成一个命名的方案（可跨次打开复用、可删除）；"
                      "内置方案（含「经典（默认）」＝程序默认）不可删除。\n"
                      "只存色相，**通透度按角色固定**：波形面板不透明、钢琴卷帘波形半透明、"
                      "PIT 线 alpha≈205，所以换色不会把波形/PIT 改糊。\n"
+                     "口型面板背景**不参与自定义**（沿用软件主题色），只有曲线描边与填充两色可改。\n"
                      "休止符(灰)、连音音符(绿)、选中框(黄)是**语义标记色**，保持固定不参与自定义。")
         tip.setWordWrap(True)
         root.addWidget(tip)
@@ -526,8 +544,8 @@ class SettingsDialog(QDialog):
 
     NAV = (("语言", "主语言（跟随工程）"), ("频谱", "频谱显示"),
            ("波形", "钢琴窗波形与 PIT 音高线"),
-           ("面板", "三面板上下顺序与显示"),
-           ("配色", "音符 / PIT / 波形颜色与配色方案"))
+           ("面板", "面板上下顺序 / 显隐 / 口型纵轴"),
+           ("配色", "音符 / PIT / 波形 / 口型颜色与配色方案"))
 
     def __init__(self, settings: ProjectSettings, project: Project | None = None, parent=None):
         super().__init__(parent)

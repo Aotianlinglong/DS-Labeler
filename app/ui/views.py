@@ -535,6 +535,7 @@ class TimeCanvas(QWidget):
     sig_status = Signal(str)
     sig_selection = Signal()
     sig_viewport = Signal()          # 视窗（t0/span/KEY_H）变化 → 主窗口同步刷新所有面板
+    sig_cursor = Signal(float)       # 鼠标所在时间变化 → 主窗口广播，竖直虚线跨面板同步
 
     def __init__(self, state: ViewState, parent=None):
         super().__init__(parent)
@@ -566,6 +567,32 @@ class TimeCanvas(QWidget):
     def cursor_t(self) -> float:
         """鼠标所在时间（未在画布上时返回 -1）。"""
         return self._cursor_t
+
+    def _set_cursor_t(self, t: float) -> None:
+        """记录鼠标所在时间并发 `sig_cursor` 广播。
+
+        光标竖直虚线必须**跨面板对齐**（否则每个面板各画各的，虚线不在同一竖线上）；
+        故这里只负责记录 + 广播，实际重绘由主窗口统一分发给所有面板。
+        """
+        self._cursor_t = float(t)
+        self.sig_cursor.emit(self._cursor_t)
+
+    def _apply_cursor_t(self, t: float) -> None:
+        """主窗口广播回来：更新本面板光标时间并重绘（**不再回发**，避免递归）。
+
+        值未变则直接返回 —— 鼠标在 A 面板移动时，A 自身无需重绘两次。
+        """
+        t = float(t)
+        if t == self._cursor_t:
+            return
+        self._cursor_t = t
+        self.update()
+
+    def leaveEvent(self, event):
+        """鼠标离开画布 → 清掉竖直虚线（同样广播，免得其余面板残留一条线）。"""
+        if self._cursor_t >= 0:
+            self._set_cursor_t(-1.0)
+        super().leaveEvent(event)
 
     def _clear_tier_sel(self) -> None:
         """画布上按下左键 → 层信息栏的 words / texts 选中作废（快捷键与高亮都跟着走）。
@@ -764,6 +791,40 @@ class TimeCanvas(QWidget):
             p.drawLine(xi - 1, int(top), xi - 1, int(top) + 10)
             p.drawLine(xi, int(top), xi, int(top) + 10)
 
+    def _draw_phone_names(self, p: QPainter, phones, top: float):
+        """面板顶部音素名，带语言标签：`zh/x` → 语言段 `zh` 用暗色、本体 `x` 用亮色
+        （深色描边保证频谱亮区可读；无语言前缀的音素只画本体）。
+        频谱+钢琴窗 / 口型面板共用这一套（与边界竖线同源，逐像素对齐）。"""
+        cw = self.plot_w()
+        p.setFont(QFont("Microsoft YaHei", 8))
+        fm = p.fontMetrics()
+        for (s, e, m) in phones:
+            x0, x1 = self.t_to_x(s), self.t_to_x(e)
+            if x1 < GUTTER or x0 > GUTTER + cw or x1 - x0 < 3:
+                continue
+            x0 = max(x0, GUTTER)          # 不盖到左侧琴键列
+            mark = (m or "·")
+            lang, _, body = mark.partition("/")
+            text = mark if body else lang  # 无 "/" 时整体都是本体
+            rect = QRectF(x0 + 2, top + 1, max(1.0, x1 - x0 - 3), 15)
+            p.save()
+            p.setClipRect(rect.adjusted(-2, -1, 0, 1))
+            # 深色描边（频谱亮区也可读）
+            p.setPen(QColor(0, 0, 0, 210))
+            p.drawText(rect.adjusted(1, 1, 1, 1), Qt.AlignLeft | Qt.AlignVCenter, text)
+            if body:                       # 语言标签（暗色）+ 本体（亮色）
+                lp = QRectF(rect.x(), rect.y(), fm.horizontalAdvance(lang + "/"), rect.height())
+                p.setPen(QColor("#9aa3ad"))
+                p.drawText(lp, Qt.AlignLeft | Qt.AlignVCenter, lang + "/")
+                bp = QRectF(rect.x() + lp.width(), rect.y(),
+                            max(1.0, rect.width() - lp.width()), rect.height())
+                p.setPen(QColor("#eef2f8"))
+                p.drawText(bp, Qt.AlignLeft | Qt.AlignVCenter, body)
+            else:
+                p.setPen(QColor("#eef2f8"))
+                p.drawText(rect, Qt.AlignLeft | Qt.AlignVCenter, text)
+            p.restore()
+
     # ---- 缩放/滚动（视窗变化 → 同步刷新所有面板，避免"各缩各的"割裂感） ----
     def wheelEvent(self, event):
         """操作映射（三面板语义一致）：
@@ -865,7 +926,7 @@ class WaveformView(TimeCanvas):
         pos = event.position()
         btn = event.button()
         t = self.x_to_t(pos.x())
-        self._cursor_t = t if pos.x() >= GUTTER else -1.0
+        self._set_cursor_t(t if pos.x() >= GUTTER else -1.0)
         if btn == Qt.MiddleButton:                 # 中键平移（与其它面板同步）
             self._start_pan(pos.x(), pos.y())
             self.setCursor(Qt.ClosedHandCursor)
@@ -885,13 +946,228 @@ class WaveformView(TimeCanvas):
 
     def mouseMoveEvent(self, event):
         pos = event.position()
-        self._cursor_t = self.x_to_t(pos.x()) if pos.x() >= GUTTER else -1.0
+        self._set_cursor_t(self.x_to_t(pos.x()) if pos.x() >= GUTTER else -1.0)
         if self._update_pan(pos.x(), pos.y()):
             return
         if self._drag is not None:
             self._apply_boundary(self._drag, self.x_to_t(pos.x()))
             self.update()
             self.sig_viewport.emit()          # 与频谱+MIDI 面板同步重绘
+            return
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        if self._end_pan():
+            return
+        if self._drag is not None:
+            changed = self.model.commit_snapshot("移动音素边界", self._drag["before"])
+            self._drag = None
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+            self.sig_viewport.emit()
+            if changed:
+                self.sig_changed.emit()
+            return
+        self.update()
+
+
+# ======================================================================
+# 口型面板（R3MOE 开口度曲线）：填充 + 描边，两色可自定义；背景用软件主题色
+# ======================================================================
+class CurveCanvas(TimeCanvas):
+    """口型（开口度）曲线面板：**只读**显示，交互与其余面板一致（平移/缩放/选中音素）。
+
+    - 曲线取自 R3MOE（core/curve.py），值 = 归一化开口度（1 = 最大张口）；
+    - 纵向标尺：默认**按当前句峰值自适应**（把该句最大张口顶到面板顶端，形状才看得清），
+      可在设置→「面板」页或「显示」菜单关掉 → 退回绝对标尺（0 底 / 1 顶）；
+    - 画法：曲线下方**填充** + 曲线**描边**（两色来自设置→「配色」页，可自定义）；
+    - 顶部画音素边界竖线与音素名（与钢琴卷帘同源、逐像素对齐）；
+    - 背景刻意用软件主题色（`th.CANVAS_BG`），**不用 #2c2c2c 那类深灰**；
+    - 曲线不可编辑，只做浏览。
+    """
+
+    LINE_RGB_DEFAULT = _rgb_of(DEFAULT_COLORS["curve_line_color"])   # 描边默认色
+    FILL_RGB_DEFAULT = _rgb_of(DEFAULT_COLORS["curve_fill_color"])   # 填充默认色
+
+    def __init__(self, state: ViewState, parent=None):
+        super().__init__(state, parent)
+        self._curve: np.ndarray | None = None
+        self._curve_fps = 50.0
+        self._autoscale = True                 # 纵轴按当前句峰值自适应（默认开）
+        self._drag: dict | None = None
+        self._line = QColor(*self.LINE_RGB_DEFAULT)
+        self._fill = QColor(*self.FILL_RGB_DEFAULT)
+
+    # ---- 数据 / 配色 ----
+    def set_curve(self, curve: np.ndarray | None, fps: float = 50.0):
+        self._curve = (np.asarray(curve, dtype=np.float32) if curve is not None
+                       and len(curve) else None)
+        self._curve_fps = float(fps) if fps and fps > 0 else 50.0
+        self.update()
+
+    def set_autoscale(self, on: bool) -> None:
+        """纵轴是否按当前句峰值自适应（软件级设置，设置→「面板」页 / 「显示」菜单同源）。"""
+        self._autoscale = bool(on)
+        self.update()
+
+    def set_curve_colors(self, line=None, fill=None) -> None:
+        """设置口型曲线的描边 / 填充色（"#rrggbb" / (r,g,b)）；不改则保留原色。"""
+        if line is not None:
+            self._line = QColor(*_rgb_of(line, self.LINE_RGB_DEFAULT))
+        if fill is not None:
+            self._fill = QColor(*_rgb_of(fill, self.FILL_RGB_DEFAULT))
+        self.update()
+
+    def _y_of(self, v: float, y0: float, span: float) -> float:
+        """开口度 → 屏幕 y：0 = 基线(闭嘴，靠下)，1 = 顶端(最大张口)；负值夹到基线。"""
+        return y0 - float(min(1.0, max(0.0, v))) * span
+
+    def _vscale(self) -> float:
+        """纵轴满量程对应的开口度：自适应 = 当前句峰值（下限 0.05，避免静音句被放大成噪声），
+        否则 = 1.0（绝对标尺）。"""
+        if not self._autoscale:
+            return 1.0
+        if self._curve is None or len(self._curve) == 0:
+            return 1.0
+        return max(0.05, min(1.0, float(self._curve.max())))
+
+    def peak(self) -> float:
+        """当前句开口度峰值（1 = 最大张口）；无数据时 0。"""
+        return (float(self._curve.max())
+                if self._curve is not None and len(self._curve) else 0.0)
+
+    # ---- 绘制 ----
+    def paintEvent(self, event):
+        p = QPainter(self)
+        self._paint_bg(p, th.CANVAS_BG)
+        w, h = self.width(), self.height()
+        top, bottom = BAND_H, h
+        phones = self.model.phones if self.model else []
+
+        if self._curve is None or len(self._curve) == 0:
+            p.setPen(QColor("#667"))
+            p.drawText(QRectF(GUTTER, top, self.plot_w(), max(1, bottom - top)),
+                       Qt.AlignCenter, "无口型数据")
+        else:
+            self._draw_curve(p, QRectF(GUTTER, top, self.plot_w(), max(1, bottom - top)))
+        self._draw_phone_boundaries(p, phones, top, bottom)
+        # 音素名（与边界竖线同源；只画名字不画音素块，观感与钢琴卷帘一致）
+        self._draw_phone_names(p, phones, top)
+
+        # 左侧名称提示 + （自适应时）当前句峰值：让用户知道纵轴不是绝对 0…1
+        p.setPen(QColor("#6b7280"))
+        p.setFont(QFont("Consolas", 8))
+        p.drawText(QRectF(4, top, GUTTER - 8, 16), Qt.AlignLeft | Qt.AlignVCenter, "口型")
+        if self._curve is not None and len(self._curve):
+            p.setFont(QFont("Consolas", 7))
+            p.drawText(QRectF(4, top + 15, GUTTER - 8, 13), Qt.AlignLeft | Qt.AlignVCenter,
+                       f"峰 {self.peak():.2f}")
+        self._draw_play_cursor(p)
+        self._draw_frame(p)
+        p.end()
+
+    def _draw_curve(self, p: QPainter, rect: QRectF):
+        """在 rect 内画口型曲线（填充 + 描边）。时间映射走全局 x_to_t / t_to_x，
+        与其余面板逐像素对齐（严禁用 rect 宽度自己重算局部线性映射）。
+
+        纵向：`_vscale()` 给满量程（自适应=当前句峰值 / 绝对=1.0），所有值先除以它
+        再映射到基线→顶端，于是自适应下该句峰值恒顶到面板顶部。
+        """
+        cv = self._curve
+        fps = self._curve_fps
+        inv = 1.0 / self._vscale()          # 归一到「满量程」
+        pad = min(8.0, rect.height() * 0.06)
+        y0 = rect.bottom() - pad            # 闭嘴基线
+        span = max(1.0, rect.height() - 2 * pad)
+        xa = max(GUTTER, int(math.floor(rect.left())))
+        xb = min(self.width(), int(math.ceil(rect.right())))
+        pwn = xb - xa
+        if pwn < 2:
+            return
+        xs: list[float] = []
+        ys: list[float] = []
+        if self.sec_per_px() * fps >= 1.0:
+            # 缩小档：每屏幕像素列取该列时间区间内曲线的**峰值**（张口更醒目）
+            ta, tb = self.x_to_t(xa), self.x_to_t(xb)
+            idx = np.clip(np.linspace(ta * fps, tb * fps, pwn + 1).astype(np.int64),
+                          0, len(cv))
+            for k in range(pwn):
+                lo, hi = int(idx[k]), max(int(idx[k + 1]), int(idx[k]) + 1)
+                seg = cv[lo:hi]
+                v = float(seg.max()) if len(seg) else 0.0
+                xs.append(float(xa + k))
+                ys.append(self._y_of(v * inv, y0, span))
+        else:
+            # 放大档：逐帧用 t_to_x 定位（线性插值交给 Qt 折线，不挤在左边）
+            ta = max(0.0, self.x_to_t(xa))
+            tb = min(self.state.duration, self.x_to_t(xb))
+            i0 = max(0, int(math.floor(ta * fps)))
+            i1 = min(len(cv), int(math.ceil(tb * fps)) + 1)
+            for i in range(i0, i1):
+                xs.append(float(self.t_to_x(i / fps)))
+                ys.append(self._y_of(float(cv[i]) * inv, y0, span))
+        if len(xs) < 2:
+            return
+        p.save()
+        p.setClipRect(rect)
+        p.setPen(QPen(QColor("#3a4049"), 1))              # 闭嘴基线
+        p.drawLine(QPointF(rect.left(), y0), QPointF(rect.right(), y0))
+        # 填充：曲线 + 基线围成的区域
+        path = QPainterPath()
+        path.setFillRule(Qt.WindingFill)
+        path.addPolygon(QPolygonF(
+            [QPointF(x, y) for x, y in zip(xs, ys)]
+            + [QPointF(xs[-1], y0), QPointF(xs[0], y0)]))
+        p.setPen(Qt.NoPen)
+        p.fillPath(path, QBrush(self._fill))
+        # 描边：沿曲线画折线
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(self._line, 1.6))
+        p.drawPolyline(QPolygonF([QPointF(x, y) for x, y in zip(xs, ys)]))
+        p.restore()
+
+    # ---- 交互（曲线本身不可编辑；其余与钢琴卷帘一致：中键平移 / 右键播放所点音素 /
+    #      左键选中音素与拖边界）----
+    def mousePressEvent(self, event):
+        pos = event.position()
+        btn = event.button()
+        t = self.x_to_t(pos.x())
+        self._set_cursor_t(t if pos.x() >= GUTTER else -1.0)
+        if btn == Qt.MiddleButton:
+            self._start_pan(pos.x(), pos.y())
+            self.setCursor(Qt.ClosedHandCursor)
+            return
+        # 右键：播放所点音素（与钢琴卷帘同一手势；本面板只读，故不给音符菜单）
+        if btn == Qt.RightButton and pos.x() >= GUTTER and self.model is not None:
+            idx = self.model.phone_index_at(t)
+            if idx >= 0:
+                s, e, _m = self.model.phones[idx]
+                self.state.sel_phone, self.state.sel_note = idx, -1
+                self.sig_selection.emit()
+                self.sig_play_phoneme.emit(s, e)
+                self.update()
+            return
+        if btn == Qt.LeftButton and pos.x() >= GUTTER and self.model is not None:
+            self._clear_tier_sel()
+            drag = self._try_boundary_drag(t)
+            if drag is not None:
+                self._drag = drag
+                self.setCursor(Qt.SizeHorCursor)
+                return
+            idx = self.model.phone_index_at(t)
+            self.state.sel_phone, self.state.sel_note = idx, -1
+            self.sig_selection.emit()
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        pos = event.position()
+        self._set_cursor_t(self.x_to_t(pos.x()) if pos.x() >= GUTTER else -1.0)
+        if self._update_pan(pos.x(), pos.y()):
+            return
+        if self._drag is not None:
+            self._apply_boundary(self._drag, self.x_to_t(pos.x()))
+            self.update()
+            self.sig_viewport.emit()
             return
         self.update()
 
@@ -1512,39 +1788,6 @@ class SpectroRollView(TimeCanvas):
         p.setPen(QPen(QColor(th.LINE), 1))
         p.drawLine(GUTTER, 0, GUTTER, self.height())
 
-    def _draw_phone_names(self, p: QPainter, phones, top: float):
-        """面板顶部音素名，带语言标签：`zh/x` → 语言段 `zh` 用暗色、本体 `x` 用亮色
-        （深色描边保证频谱亮区可读；无语言前缀的音素只画本体）。"""
-        cw = self.plot_w()
-        p.setFont(QFont("Microsoft YaHei", 8))
-        fm = p.fontMetrics()
-        for (s, e, m) in phones:
-            x0, x1 = self.t_to_x(s), self.t_to_x(e)
-            if x1 < GUTTER or x0 > GUTTER + cw or x1 - x0 < 3:
-                continue
-            x0 = max(x0, GUTTER)          # 不盖到左侧琴键列
-            mark = (m or "·")
-            lang, _, body = mark.partition("/")
-            text = mark if body else lang  # 无 "/" 时整体都是本体
-            rect = QRectF(x0 + 2, top + 1, max(1.0, x1 - x0 - 3), 15)
-            p.save()
-            p.setClipRect(rect.adjusted(-2, -1, 0, 1))
-            # 深色描边（频谱亮区也可读）
-            p.setPen(QColor(0, 0, 0, 210))
-            p.drawText(rect.adjusted(1, 1, 1, 1), Qt.AlignLeft | Qt.AlignVCenter, text)
-            if body:                       # 语言标签（暗色）+ 本体（亮色）
-                lp = QRectF(rect.x(), rect.y(), fm.horizontalAdvance(lang + "/"), rect.height())
-                p.setPen(QColor("#9aa3ad"))
-                p.drawText(lp, Qt.AlignLeft | Qt.AlignVCenter, lang + "/")
-                bp = QRectF(rect.x() + lp.width(), rect.y(),
-                            max(1.0, rect.width() - lp.width()), rect.height())
-                p.setPen(QColor("#eef2f8"))
-                p.drawText(bp, Qt.AlignLeft | Qt.AlignVCenter, body)
-            else:
-                p.setPen(QColor("#eef2f8"))
-                p.drawText(rect, Qt.AlignLeft | Qt.AlignVCenter, text)
-            p.restore()
-
     def _draw_f0(self, p: QPainter):
         f0 = self._f0
         if f0 is None or len(f0) == 0:
@@ -1719,7 +1962,7 @@ class SpectroRollView(TimeCanvas):
 
     def mouseMoveEvent(self, event):
         pos = event.position()
-        self._cursor_t = self.x_to_t(pos.x()) if pos.x() >= GUTTER else -1.0
+        self._set_cursor_t(self.x_to_t(pos.x()) if pos.x() >= GUTTER else -1.0)
         if self._pitch_anchor is not None:      # 琴键列拖拽 → 垂直平移音高
             y0, m0 = self._pitch_anchor
             self._center_midi = m0 + (pos.y() - y0) / self.KEY_H

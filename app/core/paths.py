@@ -27,6 +27,9 @@ REFURBISH_DIR = pathlib.Path(
 # 推理模型
 RMVPE_MODEL = MODELS_DIR / "rmvpe" / "rmvpe.onnx"
 GAME_MODEL_DIR = ENGINE_DIR / "GAME-ONNX" / "GAME-1.0.3-medium-onnx"
+# 口型（开口度）提取：R3MOE 的 ONNX 导出（自备，见 README/CREDITS）。
+# 上游：https://github.com/KakaruHayate/R3MOE（MPL-2.0）。本仓库不打包权重。
+MOUTH_MODEL = MODELS_DIR / "r3moe" / "opec.onnx"
 
 # 内置元辅词典
 DICT_DIR = ASSETS_DIR / "dictionaries"

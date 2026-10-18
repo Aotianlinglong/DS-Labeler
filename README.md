@@ -6,8 +6,8 @@
 面向 DiffSinger 数据集制作流水线：读入 `wav/` + `TextGrid/`，用神经模型自动生成音符与 F0，
 人工修正音素边界、词 / 短语层与音符，最后导出 `raw/wavs + transcriptions.csv`，或把修正结果回写 TextGrid。
 
-- **交互**：三面板（波形 / mel 频谱 / 钢琴卷帘）同轴对齐，缩放与滚动同步
-- **推理**：RMVPE 提取 F0、GAME 生成音符（ONNX Runtime，Windows 下默认走 DirectML GPU）
+- **交互**：四面板（波形 / 钢琴卷帘 / 口型 / 频谱）同轴对齐，缩放与滚动同步，显隐与顺序可调
+- **推理**：RMVPE 提取 F0、GAME 生成音符、R3MOE 提取口型（开口度）曲线（ONNX Runtime，Windows 下默认走 DirectML GPU）
 - **编辑**：音素层与词 / 短语层可独立编辑，边界对齐时向上联动；所有编辑均可撤销 / 重做（`Ctrl+Z` / `Ctrl+Y`）
 - **两类工程**：标准 TextGrid 工程，以及只有 `transcriptions.csv` + 音频的「翻新工程」
 
@@ -68,12 +68,20 @@ VC 运行时与 `onnxruntime_pybind11_state` 冲突，后导入会报「DLL 初�
 |---|---|---|
 | `rmvpe.onnx`（约 362 MB） | `models/rmvpe/rmvpe.onnx` | [RVC 项目](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI) 使用的 RMVPE ONNX 导出：<https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.onnx> |
 | `GAME-1.0.3-medium-onnx/`（6 个文件，约 190 MB） | `engine/GAME-ONNX/GAME-1.0.3-medium-onnx/` | [openvpi/GAME](https://github.com/openvpi/GAME) 的 release **v1.0.3** 附带 ONNX 模型 |
+| `opec.onnx`（约 40 MB，口型曲线，**可选**） | `models/r3moe/opec.onnx` | [KakaruHayate/R3MOE](https://github.com/KakaruHayate/R3MOE)（许可 **MPL-2.0**）的 ONNX 导出 |
 
 `GAME-1.0.3-medium-onnx/` 下应有：`encoder.onnx`、`segmenter.onnx`、`estimator.onnx`、
 `dur2bd.onnx`、`bd2dur.onnx`、`config.json`。
 
 GAME 的 ONNX 模型采用 **CC BY-NC-SA 4.0** 许可（**非商业使用**），详见上游 release 说明。
 缺失模型时软件仍可启动，只是自动生成音符 / F0 相关功能不可用。
+
+R3MOE 的口型模型用于「口型面板」（开口度曲线）。上游只发布训练工程与 `export_onnx.py`，
+需自行导出 ONNX：部署好的权重导出后即为 `opec.onnx`。该权重**可缺**：缺失时口型面板
+只是没有内容，其余功能不受影响。导出脚本内部已把输入采样率固定为 **44.1 kHz**（再重采样到
+16 kHz），故软件喂入 44.1 kHz 单声道波形，输出为 50 帧 / 秒的开口度（1 = 最大张口）。
+
+**本仓库不打包任何权重**，也未包含 R3MOE 的源代码（本软件只调用 ONNX Runtime 做推理）。
 
 ---
 
@@ -93,6 +101,7 @@ DS-Labeler/
 │   │   ├── notes.py        #     音符模型（MIDI 保留音分）
 │   │   ├── phonemes.py     #     多语言元辅分类 + ph_num
 │   │   ├── spectrogram.py  #     mel 频谱（整段缓存 + 配色）
+│   │   ├── curve.py        #     口型（开口度）曲线：R3MOE ONNX 推理 + 缓存读写
 │   │   ├── edit.py         #     编辑操作 + 层间联动 + 标签计算
 │   │   ├── undo.py         #     命令栈（命令式 / 快照式）
 │   │   ├── export.py       #     导出 raw/wavs + transcriptions.csv
@@ -100,15 +109,16 @@ DS-Labeler/
 │   ├── ui/
 │   │   ├── theme.py        #     深色主题
 │   │   ├── main_window.py  #     主窗口（菜单 / 层信息栏 / 自动保存）
-│   │   ├── views.py        #     波形 / 频谱 / 钢琴卷帘三视图 + 交互
+│   │   ├── views.py        #     波形 / 频谱 / 钢琴卷帘 / 口型四视图 + 交互
 │   │   ├── settings_dialog.py #  统一设置面板（语言 / 频谱 / 波形 / 面板 / 配色）
-│   │   ├── worker.py       #     后台推理线程（RMVPE + GAME）
+│   │   ├── worker.py       #     后台推理线程（RMVPE + GAME + 口型）
 │   │   └── audio.py        #     音频播放（播放当前视窗）
 │   └── engine/
 │       ├── onnx_util.py    #     ONNX 会话（DirectML 优先 / CPU 回退）
 │       ├── f0.py           #     RMVPE F0 提取 + F0 缓存
 │       └── game.py         #     GAME 音符生成（压缩时间轴映射）
 ├── models/rmvpe/           # RMVPE 权重（自备，见第 2 节）
+├── models/r3moe/           # R3MOE 口型权重（自备，见第 2 节）
 ├── engine/GAME-ONNX/       # GAME ONNX 模型（自备，见第 2 节）
 └── assets/dictionaries/    # 内置音素词典（可直接编辑，见第 7 节）
 ```
@@ -139,11 +149,14 @@ DS-Labeler/
 
 1. **工程菜单**：`新建工程…`（Ctrl+N）/ `打开工程…`（Ctrl+O）/ `最近工程`（路径失效则置灰）。
    首次打开需填**主语言**，随后自动后台批量预处理（RMVPE F0 + GAME 音符，进度在状态栏）。
-   `保存工程`（Ctrl+S，另有自动保存）。`工具`菜单可 `批量预处理` / `重跑当前句` / `批量替换音素…`。
+   `保存工程`（Ctrl+S，另有自动保存）。`工具`菜单可 `批量预处理` / `重跑当前句` / `批量替换音素…` /
+   `计算所有文件口型`（后台批量计算口型曲线并缓存；需已放置 R3MOE 权重）。
 2. **顶部层信息栏**：显示当前句、时长、音素数 / 音符数，以及选中 / 悬停音素与选中音符的
    起止、时长、音名；同时也是 **words / texts 层的编辑面板**（见下）。
-3. **面板**：波形、mel 频谱、钢琴卷帘（含 F0 曲线）三者同轴对齐，可用 `QSplitter` 拖拽调整；
-   `显示`菜单或 设置 →「面板」页可分别开 / 关，顺序可调。
+3. **面板**：波形、钢琴卷帘（含 F0 曲线）、口型、mel 频谱四者同轴对齐，可用 `QSplitter` 拖拽调整；
+   `显示`菜单或 设置 →「面板」页可分别开 / 关，顺序可调（默认 **波形 → 钢琴卷帘 → 口型 → 频谱**）。
+   口型面板**默认关闭**（打开后曲线**不可编辑**，顶部画音素边界竖线与音素名，其余交互与钢琴卷帘一致），
+   纵轴可「按当前句峰值自适应高度」（`显示`菜单或 设置 →「面板」页，默认开）。
 4. **编辑**：
    - **播放**：空格 = 播放 / 停止。**右键**：在频谱 / 钢琴卷帘窗内右键**未命中音符**处 → 播放该处音素；
      右键**命中音符** → 弹出菜单（设为 / 取消 连音、无声）。
@@ -165,7 +178,7 @@ DS-Labeler/
    `↑` `↓` 上下移 ±1 半音，`Shift+↑/↓` ±10 音分。休止与连音按各自规则参与时长分配。
 8. **缩放 / 滚动**：滚轮 = 上下滚动、`Shift+滚轮` = 水平滚动、`Ctrl+滚轮` = 时间轴缩放
    （以光标为中心）、`Alt+滚轮` = 音高方向缩放；中键拖动 = 平移画布；`Z` = 适配全曲。
-   视图菜单另有 `放大` / `缩小` / `三面板均分` / `频谱配色`。
+   视图菜单另有 `放大` / `缩小` / `面板均分` / `频谱配色`。
 9. **撤销 / 重做**：`Ctrl+Z` / `Ctrl+Y`（或 `Ctrl+Shift+Z`）。所有编辑（含层边界拖动、
    改名、复制、删除）都是一条可撤销命令。
 10. **导出**：`导出数据集…` 弹窗填**音色名称**（必填，记进工程、下次预填），输出
@@ -225,6 +238,7 @@ DS-Labeler/
 |---|---|---|
 | [GAME](https://github.com/openvpi/GAME)（openvpi） | 音符自动生成 | 代码开源；附带的 ONNX 模型为 **CC BY-NC-SA 4.0（非商业）** |
 | [RMVPE](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI) | F0 提取 | 见上游 |
+| [R3MOE](https://github.com/KakaruHayate/R3MOE) | 口型（开口度）曲线提取 | 代码 **MPL-2.0**；ONNX 权重需自行导出，不随源码分发 |
 | [DiffSinger](https://github.com/openvpi/DiffSinger) / [MakeDiffSinger](https://github.com/openvpi/MakeDiffSinger) | 数据格式与流水线约定（`transcriptions.csv`、`ph_num`、TextGrid 三层等） | 见各自仓库 |
 | [Qt for Python (PySide6)](https://doc.qt.io/qtforpython/) | 界面框架 | LGPLv3 |
 | numpy / scipy / librosa / soundfile / sounddevice / onnxruntime | 数值、音频、推理 | BSD / ISC / MIT 等，见各包 |
