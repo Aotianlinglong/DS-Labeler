@@ -1,0 +1,14 @@
+# DS-Labeler 运行依赖（Python >= 3.10；已在 3.12 上验证）
+#
+# 安装：pip install -r requirements.txt
+#
+# ONNX 运行时二选一：
+#   onnxruntime-directml —— Windows + DX12 显卡走 GPU（本软件默认口径）
+#   onnxruntime          —— 纯 CPU 回退（把上面一行换成 onnxruntime 即可，推理明显变慢）
+PySide6-Essentials>=6.7
+numpy>=1.26
+scipy>=1.11
+soundfile>=0.12
+sounddevice>=0.4
+librosa>=0.10
+onnxruntime-directml>=1.19
