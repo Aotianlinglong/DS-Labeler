@@ -1039,6 +1039,7 @@ class CurveCanvas(TimeCanvas):
     # ---- 绘制 ----
     def paintEvent(self, event):
         p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)   # 曲线 / 边界线抗锯齿（默认关，开启更平滑）
         self._paint_bg(p, th.CANVAS_BG)
         w, h = self.width(), self.height()
         top, bottom = BAND_H, h
@@ -1631,6 +1632,12 @@ class SpectroRollView(TimeCanvas):
             p.setBrush(fill)
             p.setPen(QPen(border, 1))
             p.drawRoundedRect(rect, 2, 2)
+            if not n.rest:
+                # 块正中的水平细线 = 该音符的**绝对 MIDI 音高**（midi_to_y 正好落在块中心），
+                # 便于对照 PIT 曲线与音符的音分偏移。颜色与音符边缘同色；休止符不在音高行上，不画。
+                ym = rect.center().y()
+                p.setPen(QPen(border, 1))
+                p.drawLine(QPointF(rect.left() + 1.0, ym), QPointF(rect.right() - 1.0, ym))
             if i == st.sel_note:
                 p.setPen(QPen(QColor(255, 235, 90, 250), 2))
                 p.setBrush(Qt.NoBrush)
