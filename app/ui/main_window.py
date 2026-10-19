@@ -531,6 +531,16 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         self.project = proj
+        # ✓ 标记只属于「人工编辑过」的句子（编辑必有自动保存的工作文件）。
+        # 旧版曾把「预处理完成」也写进 edited，打开时把没有工作文件的条目剔掉。
+        _gone = {n for n in proj.edited if not proj.sentence_work_file(n).exists()}
+        if _gone:
+            proj.edited -= _gone
+            self._log(f"剔除 {len(_gone)} 句误标的「已编辑」标记（实为预处理完成，非人工编辑）")
+            try:
+                proj.save()
+            except Exception:
+                pass
         # 界面设置与布局是**软件级**的：把工程接到同一份对象上，
         # 于是各处的 project.settings / project.save() 都自然写向 app_settings.json
         proj.settings = self.app_settings
@@ -1086,14 +1096,6 @@ class MainWindow(QMainWindow):
             item.setText(self._item_text(self._current))
             item.setForeground(Qt.gray)
 
-    def _mark_list_item_by(self, name: str):
-        if self.project is not None and name:
-            self.project.edited.add(name)
-        item = self._list_item_named(name)
-        if item is not None:
-            item.setText(self._item_text(name))
-            item.setForeground(Qt.gray)
-
     def _refresh_views(self):
         for v in (self.view, self.spec_view, self.wave, self.curve):
             v.update()
@@ -1309,17 +1311,18 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"预处理 {name}（{done}/{total}）")
 
     def _on_sentence_ready(self, name: str, data: SentenceData):
-        self._mark_list_item_by(name)
+        # 注意：预处理完成**不**标记 ✓（那是「人工编辑过」的标记）；进度看状态栏即可
         if name != self._current:
             return
-        # 仅当当前句尚无音符且未被用户编辑时才就地替换（避免覆盖用户改动）
-        if self.editor is not None and (self.editor.dirty or self.editor.notes):
-            return
-        self.editor = EditModel(data)
-        for v in (self.view, self.spec_view, self.wave, self.curve):
-            v.set_model(self.editor)
+        # 仅当当前句尚无音符且未被用户编辑时才就地替换编辑器（避免覆盖用户改动）。
+        # 注意守卫只挡「换编辑器」：F0 与编辑无关，当前句永远要刷新 PIT——
+        # 翻新工程从 csv 建的编辑器天生带 notes，不拆开守卫会连 PIT 一起挡掉。
+        if self.editor is None or not (self.editor.dirty or self.editor.notes):
+            self.editor = EditModel(data)
+            for v in (self.view, self.spec_view, self.wave, self.curve):
+                v.set_model(self.editor)
+            self._update_label()
         self._load_f0(name)
-        self._update_label()
 
     def _on_infer_failed(self, name: str, err: str):
         self._log(f"推理失败 {name}: {err}")
