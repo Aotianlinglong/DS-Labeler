@@ -179,6 +179,8 @@ class MainWindow(QMainWindow):
             v.sig_selection.connect(self._on_view_selection)
             v.sig_viewport.connect(self._sync_viewport)
             v.sig_cursor.connect(self._on_cursor_moved)   # 光标竖直虚线跨面板同步
+        self.view.sig_audition_note.connect(self._audition_note)   # 琴键列按下试听
+        self.view.sig_audition_stop.connect(self.audio.stop_tone)  # 琴键列松开停止
         for k, w in (("wave", self.wave), ("roll", self.view),
                      ("curve", self.curve), ("spec", self.spec_view)):
             if self.app_settings and bool(getattr(self.app_settings,
@@ -1585,6 +1587,10 @@ class MainWindow(QMainWindow):
         self.audio.play_range(t0, t1)
         self._timer.start()
 
+    def _audition_note(self, midi: int):
+        """琴键列左键按下 → 开始持续发声（松开才停；算法合成，零采样文件）。"""
+        self.audio.start_tone(midi)
+
     def _play_phoneme(self, t0: float, t1: float):
         """右键播放所点音素：只播 [start, end)，播放头定位到起点。"""
         self.audio.stop()
@@ -1627,6 +1633,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self.audio.stop()
+        self.audio.close()              # 释放常驻的试听流
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait(15000)     # 预热/建会话可能正在跑（不可中断）：给足时间再析构 QThread

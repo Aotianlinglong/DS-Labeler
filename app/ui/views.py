@@ -1252,6 +1252,8 @@ class SpectroRollView(TimeCanvas):
     NOTE_BORDER_ALPHA = 220
     NOTE_WHITE_MIX = 0.85        # 描边 = 填充色向白混合这个比例
     KEYS = range(12, 120)
+    sig_audition_note = Signal(int)   # 琴键列左键按下 → 试听该 MIDI 音高（主窗口发声）
+    sig_audition_stop = Signal()      # 松开琴键 → 停止发声
 
     @property
     def WAVE_H(self) -> float:
@@ -1351,6 +1353,7 @@ class SpectroRollView(TimeCanvas):
         self._pending_center: float | None = None   # 工程记忆的纵中心（仅首句对音高时生效一次）
         self._drag: dict | None = None
         self._pitch_anchor: tuple[float, float] | None = None   # 琴键列拖拽平移音高
+        self._auditioning = False      # 是否正按着琴键发声（松开时要发停止信号）
         self.labeler = None            # 音符标签器（主窗口注入：辅音+元音）
         self._pan_midi0 = self._center_midi      # 中键自由平移的起始音高中心
         self.setMinimumHeight(180 if self.show_notes else 96)
@@ -1920,9 +1923,13 @@ class SpectroRollView(TimeCanvas):
                 self.sig_play_phoneme.emit(s, e)
                 self.update()
             return
-        # 琴键列：左键/中键上下拖拽 = 垂直平移音高（琴键列中键上下移的手势）
+        # 琴键列：左键 = 按住试听该音高（按住一直响、松开停，与常见钢琴窗一致）；
+        # 左/中键上下拖拽 = 垂直平移音高（琴键列中键上下移的手势）
         if pos.x() < GUTTER:
             if self.show_notes and btn in (Qt.LeftButton, Qt.MiddleButton):
+                if btn == Qt.LeftButton:
+                    self._auditioning = True
+                    self.sig_audition_note.emit(int(round(self.y_to_midi(pos.y()))))
                 self._pitch_anchor = (pos.y(), self._center_midi)
                 self.setCursor(Qt.SizeVerCursor)
             return
@@ -1998,6 +2005,9 @@ class SpectroRollView(TimeCanvas):
         self.update()
 
     def mouseReleaseEvent(self, event):
+        if self._auditioning:              # 琴键列按住发声 → 松开即停
+            self._auditioning = False
+            self.sig_audition_stop.emit()
         if self._pitch_anchor is not None:
             self._pitch_anchor = None
             self.setCursor(Qt.ArrowCursor)
