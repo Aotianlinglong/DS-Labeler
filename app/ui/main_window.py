@@ -17,8 +17,10 @@ from PySide6.QtCore import Qt, QTimer, QSettings
 from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QListWidget, QListWidgetItem, QVBoxLayout, QHBoxLayout,
-    QFileDialog, QMessageBox, QInputDialog, QComboBox, QSplitter,
+    QFileDialog, QMessageBox, QInputDialog, QComboBox, QSplitter, QProgressBar,
 )
+
+import ui.theme as th
 
 from core.csv_io import write_csv
 from core.curve import FPS as CURVE_FPS, MouthCurveExtractor, load_curve, save_curve
@@ -39,7 +41,7 @@ from ui.settings_dialog import SettingsDialog
 from ui.views import CurveCanvas, SpectroRollView, TierBar, ViewState, WaveformView
 from ui.worker import InferenceWorker, MouthCurveWorker
 
-BUILD = "2026.10.19-r50"    # 版本指纹（标题栏可见；改动未生效时先核对这个）
+BUILD = "2026.10.19-r50"    # 版本指纹（启动日志可见；改动未生效时先核对这个）
 
 RECENT_MAX = 12
 
@@ -119,9 +121,8 @@ class MainWindow(QMainWindow):
         # 只在视图 keyPressEvent 里处理时，焦点在句子列表按空格无反应）
         QShortcut(QKeySequence(Qt.Key_Space), self, activated=self._toggle_play)
 
-        # 版本指纹：标题栏可见，用于确认实际运行的构建（排查"改了但没生效"）
+        # 版本指纹：启动日志可见，用于确认实际运行的构建（排查"改了但没生效"）
         import ui.views as _views_mod
-        self.setWindowTitle(f"DS-Labeler · build {BUILD}")
         print(f"[boot] build={BUILD}\n[boot] views={_views_mod.__file__}", flush=True)
 
         self.statusBar().showMessage(
@@ -148,6 +149,18 @@ class MainWindow(QMainWindow):
         self.list = QListWidget()
         self.list.itemSelectionChanged.connect(self._on_select_sentence)
         lv.addWidget(self.list, 1)
+        # 列表底部：人工标记进度条（✓ 句数 / 总句数，文字为「3/12 · 25%」）
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFixedHeight(18)
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("0/0 · 0%")
+        self.progress_bar.setStyleSheet(
+            f"QProgressBar {{ border: 1px solid {th.LINE}; border-radius: 3px; "
+            f"margin: 3px 4px; background: {th.BASE}; color: {th.TEXT_DIM}; text-align: center; }}"
+            f"QProgressBar::chunk {{ background: {th.ACCENT}; border-radius: 2px; }}")
+        lv.addWidget(self.progress_bar)
         main_split.addWidget(left)
 
         # 右：层信息栏 + 三面板
@@ -715,6 +728,7 @@ class MainWindow(QMainWindow):
                 self.list.addItem(item)
         finally:
             self._switching = False
+        self._update_progress()          # 列表重建后刷新底部「已标记」进度
         self._bind_worker()
         missing = [n for n in self._sentences if not self._is_ready(n)]
         self.statusBar().showMessage(
@@ -1097,6 +1111,21 @@ class MainWindow(QMainWindow):
         if item is not None:
             item.setText(self._item_text(self._current))
             item.setForeground(Qt.gray)
+        self._update_progress()
+
+    def _update_progress(self):
+        """左侧列表底部进度条：已手工标记（✓ = 在 project.edited 里）的句数占比。"""
+        total = self.list.count()
+        done = 0
+        if self.project is not None:
+            for i in range(total):
+                it = self.list.item(i)
+                if it is not None and it.data(Qt.UserRole) in self.project.edited:
+                    done += 1
+        pct = (done * 100.0 / total) if total else 0.0
+        self.progress_bar.setRange(0, max(1, total))    # 0 句时不进「忙碌」态
+        self.progress_bar.setValue(done)
+        self.progress_bar.setFormat(f"{done}/{total} · {pct:.0f}%")
 
     def _refresh_views(self):
         for v in (self.view, self.spec_view, self.wave, self.curve):
