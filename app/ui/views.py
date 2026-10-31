@@ -2159,10 +2159,8 @@ class SpectroRollView(TimeCanvas):
             super().keyPressEvent(event)
             return
         key, mods = event.key(), event.modifiers()
-        if key == Qt.Key_Space:
-            self.sig_play_toggle.emit()
-            event.accept()
-            return
+        # 空格播放**只由主窗口的 QShortcut 处理**：这里再发一次 sig_play_toggle 会和它
+        # 撞成双触发（play 之后立刻被 stop/重播），听起来像播了两遍。
         if mods & Qt.ControlModifier:
             if key in (Qt.Key_Z, Qt.Key_Y):
                 # Ctrl+Y 与 Ctrl+Shift+Z 都是重做，Ctrl+Z 是撤销
