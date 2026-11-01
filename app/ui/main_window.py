@@ -16,9 +16,9 @@ import soundfile as sf
 from PySide6.QtCore import Qt, QTimer, QSettings
 from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QListWidget, QListWidgetItem, QVBoxLayout, QHBoxLayout,
-    QFileDialog, QMessageBox, QInputDialog, QComboBox, QSplitter, QProgressBar,
-    QLineEdit,
+    QMainWindow, QWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QHBoxLayout,
+    QFileDialog, QMessageBox, QInputDialog, QSplitter, QProgressBar, QLabel,
+    QLineEdit, QHeaderView, QAbstractItemView, QMenu,
 )
 
 import ui.theme as th
@@ -53,6 +53,21 @@ _PANEL_ATTR = {"wave": "wave_panel", "roll": "roll_panel",
                "curve": "curve_panel", "spec": "spec_panel"}
 _PANEL_TITLE = {"wave": "波形面板", "roll": "钢琴卷帘",
                 "curve": "口型面板", "spec": "频谱窗"}
+
+# 句子列表的列（资源管理器式「详细信息」视图）：
+# 默认只显示 名称 + 质量分；五个细分指标在表头右键勾选后才加载（默认不读这些字段）。
+_LIST_COLS = (
+    ("name", "名称"),
+    ("score", "质量分"),
+    ("confidence", "置信度"),
+    ("determinacy", "确定性"),
+    ("monotonicity", "单调性"),
+    ("agreement", "一致性"),
+    ("num_skipped_tokens", "跳过数"),
+)
+_LIST_METRICS = ("confidence", "determinacy", "monotonicity",
+                 "agreement", "num_skipped_tokens")
+_LIST_DEFAULT_VISIBLE = {"name", "score"}
 
 
 def _panel_visibility(st) -> dict[str, bool]:
@@ -90,6 +105,9 @@ class MainWindow(QMainWindow):
         # 音素搜索：每句的音素集合缓存（工作文件优先，其次源 TextGrid / csv）；
         # 打开/切换工程时清空。搜索只在搜索词非空时才真正解析文件。
         self._phone_sets: dict[str, set[str]] = {}
+        # 句子列表排序（详细信息视图：点表头切换升降序）
+        self._sort_key: str = "name"
+        self._sort_desc: bool = False
         # 切换/重建句子列表期间屏蔽选中事件：Qt 在 list.clear()/addItem() 时会自动
         # 发出 itemSelectionChanged（带旧行号、旧选中项），若照它去 _load_sentence，
         # 就会拿**上一份工程的句名**去新工程里找 wav（报"文件不存在/加载失败"），
@@ -141,15 +159,12 @@ class MainWindow(QMainWindow):
 
         self.main_split = main_split = QSplitter(Qt.Horizontal)   # 左列表 │ 右面板（尺寸进布局记忆）
 
-        # 左：句子列表（顶部音素搜索 + 排序）
+        # 左：句子列表（顶部音素搜索；排序/添加项在表头，详细信息视图）
         left = QWidget()
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0, 0, 0, 0)
         lv.setSpacing(0)
-        # 列表顶部一行：音素搜索框（左，占满）+ 排序（右，窄）
-        top_row = QHBoxLayout()
-        top_row.setContentsMargins(6, 6, 6, 4)
-        top_row.setSpacing(6)
+        # 列表顶部一行：音素搜索框（占满整行）
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("搜索音素（如 a、p、AP）")
         self.search_edit.setClearButtonEnabled(True)
@@ -161,28 +176,56 @@ class MainWindow(QMainWindow):
         self._search_timer.setInterval(250)
         self._search_timer.timeout.connect(self._reload_sentence_list)
         self.search_edit.textChanged.connect(lambda _: self._search_timer.start())
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(6, 6, 6, 4)
+        top_row.setSpacing(6)
         top_row.addWidget(self.search_edit, 1)
-        self.sort_combo = QComboBox()
-        self.sort_combo.addItems(["按名称", "按分数（低→高）", "按分数（高→低）"])
-        self.sort_combo.currentIndexChanged.connect(lambda _: self._reload_sentence_list())
-        self.sort_combo.setFixedWidth(118)       # 排序只占窄栏，其余宽度留给搜索
-        top_row.addWidget(self.sort_combo)
         lv.addLayout(top_row)
-        self.list = QListWidget()
+        # 句子列表 = 资源管理器式「详细信息」视图：
+        #   表头点击排序（升降序切换）、右键勾选「添加项」、列宽可拖。
+        self.list = QTreeWidget()
+        self.list.setColumnCount(len(_LIST_COLS))
+        self.list.setHeaderLabels([t for _k, t in _LIST_COLS])
+        self.list.setRootIsDecorated(False)
+        self.list.setUniformRowHeights(True)
+        self.list.setIndentation(0)
+        self.list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.list.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.list.setSortingEnabled(False)       # 排序在重建时自己做（数值列按数值比）
+        hdr = self.list.header()
+        hdr.setSectionsClickable(True)
+        hdr.setSortIndicatorShown(True)
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+        for i in range(1, len(_LIST_COLS)):
+            hdr.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        hdr.sectionClicked.connect(self._on_header_clicked)
+        hdr.setContextMenuPolicy(Qt.CustomContextMenu)
+        hdr.customContextMenuRequested.connect(self._on_header_menu)
+        for i, (key, _t) in enumerate(_LIST_COLS):
+            self.list.setColumnHidden(i, key not in _LIST_DEFAULT_VISIBLE)
+        self._update_sort_indicator()
         self.list.itemSelectionChanged.connect(self._on_select_sentence)
         lv.addWidget(self.list, 1)
-        # 列表底部：人工标记进度条（✓ 句数 / 总句数，文字为「3/12 · 25%」）
+        # 列表底部：人工标记进度条 + 右侧数字。数字不画在条内——
+        # 条内文字横跨「蓝色填充 + 深色底」两段，无论明度都不易读，故与条分开。
         self.progress_bar = QProgressBar()
-        self.progress_bar.setTextVisible(True)
-        self.progress_bar.setFixedHeight(18)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(12)
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("0/0 · 0%")
         self.progress_bar.setStyleSheet(
             f"QProgressBar {{ border: 1px solid {th.LINE}; border-radius: 3px; "
-            f"margin: 3px 4px; background: {th.BASE}; color: {th.TEXT_DIM}; text-align: center; }}"
+            f"background: {th.BASE}; }}"
             f"QProgressBar::chunk {{ background: {th.ACCENT}; border-radius: 2px; }}")
-        lv.addWidget(self.progress_bar)
+        self.progress_label = QLabel("0/0 · 0%")
+        self.progress_label.setStyleSheet(f"color: {th.TEXT_DIM};")
+        prog = QHBoxLayout()
+        prog.setContentsMargins(6, 4, 6, 4)
+        prog.setSpacing(6)
+        prog.addWidget(self.progress_bar, 1)
+        prog.addWidget(self.progress_label)
+        lv.addLayout(prog)
         main_split.addWidget(left)
 
         # 右：层信息栏 + 三面板
@@ -735,31 +778,34 @@ class MainWindow(QMainWindow):
         try:
             self.list.clear()
             self._sentences = self.project.list_sentences()
-            # 排序：按名称 / 按标注质量分（TextGrid/statistics/diagnosis.json，四项指标均值）
-            mode = self.sort_combo.currentIndex() if hasattr(self, "sort_combo") else 0
-            if mode in (1, 2):
-                def key(n: str):
-                    sc = Project.diagnosis_score(self._diagnosis.get(n))
-                    if sc is None:
-                        return (1, 0.0, n)                    # 无分句恒排最后
-                    return (0, sc if mode == 1 else -sc, n)
-                names = sorted(self._sentences, key=key)
-            else:
-                names = list(self._sentences)
+            names = list(self._sentences)
             # 音素搜索：只留含该音素的句子。按**裸音素名精确匹配**（"a" 不会
             # 误伤 "aa"/"ia"；输入 "zh/a" 也自动按 "a" 匹配）
             if query:
                 names = [n for n in names if query in self._sentence_phone_set(n)]
+            names = self._sort_names(names)
             for name in names:
                 sc = Project.diagnosis_score(self._diagnosis.get(name))
-                item = QListWidgetItem(self._item_text(name))
-                item.setData(Qt.UserRole, name)
-                item.setToolTip(self._diagnosis_tooltip(name))
+                item = QTreeWidgetItem()
+                item.setData(0, Qt.UserRole, name)
+                item.setText(0, self._item_text(name))
+                # 只给**当前显示的列**填值：五个细分指标默认不加载。
+                for c, (key, _t) in enumerate(_LIST_COLS):
+                    if key == "name" or self.list.isColumnHidden(c):
+                        continue
+                    v = self._diag_metric(name, key)
+                    if v is not None:
+                        item.setText(c, self._format_metric(key, v))
+                item.setToolTip(0, self._diagnosis_tooltip(name))
+                color = None
                 if sc is not None and sc < 0.85:
-                    item.setForeground(QColor("#ff9d6b"))    # 低分句标暖色，便于先审
+                    color = QColor("#ff9d6b")    # 低分句标暖色，便于先审
                 elif self._is_ready(name):
-                    item.setForeground(Qt.gray)
-                self.list.addItem(item)
+                    color = QColor(Qt.gray)
+                if color is not None:
+                    for c in range(len(_LIST_COLS)):
+                        item.setForeground(c, color)
+                self.list.addTopLevelItem(item)
         finally:
             self._switching = False
         self._update_progress()          # 列表重建后刷新底部「已标记」进度
@@ -775,7 +821,7 @@ class MainWindow(QMainWindow):
             # 行号必须按**列表显示顺序**取（按分数排序时显示序 ≠ 名称序）
             want = self.project.last_sentence
             row = names.index(want) if want in names else 0
-            self.list.setCurrentRow(row)   # 触发 _load_sentence，当前句插队优先
+            self.list.setCurrentItem(self.list.topLevelItem(row))   # 触发 _load_sentence，当前句插队优先
             # 重建期间 Qt 可能已把当前行设成 row（事件被屏蔽）→ setCurrentRow 不再发信号，
             # 这时必须显式加载，否则打开工程后停在空白界面（"什么都没载入"）
             if self._current != names[row]:
@@ -795,7 +841,6 @@ class MainWindow(QMainWindow):
     def _sentence_phone_set(self, name: str) -> set[str]:
         """句子的音素集合（搜索用）：工作文件优先，其次源 TextGrid（标准）/ csv（翻新）。
 
-        音素名统一去掉语言前缀（`zh/a` → `a`），与搜索框里输入的裸名一致。
         结果按工程生命周期缓存——搜索逐键触发时不再重复解析文件。
         """
         if name in self._phone_sets:
@@ -813,8 +858,8 @@ class MainWindow(QMainWindow):
                       else parse_textgrid(self.project.tg_dir / f"{name}.TextGrid", name))
             except Exception:
                 sd = None
-        # 两种 SentenceData：工作文件/翻新 csv 是 list[(s,e,mark)]，
-        # TextGrid 解析的是带 .marks 的层对象 —— 两种都要能取到音素名。
+        # 工作文件 / 翻新 csv 的 phones 是 list[(s,e,mark)]，TextGrid 解析的是
+        # 带 .marks 的层对象 —— 两种都要能取到音素名（否则搜索直接报错）。
         if sd is None:
             marks = set()
         elif hasattr(sd.phones, "marks"):
@@ -830,6 +875,78 @@ class MainWindow(QMainWindow):
         for v in (self.view, self.spec_view, self.wave, self.curve):
             v.set_search_text(q)
 
+    # ---- 句子列表：详细信息视图（排序 / 添加列）----
+    def _diag_metric(self, name: str, key: str):
+        """某句在某一列上的数值（缺失 → None）。"""
+        if key == "score":
+            return Project.diagnosis_score(self._diagnosis.get(name))
+        m = self._diagnosis.get(name) or {}
+        v = m.get(key)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _format_metric(key: str, v: float) -> str:
+        if key == "score":
+            return f"{v:.2f}"
+        if key == "num_skipped_tokens":
+            return f"{int(v)}"
+        return f"{v:.4f}"
+
+    def _sort_names(self, names: list[str]) -> list[str]:
+        """按当前表头列排序；缺该指标的行恒排最后（与资源管理器一致）。"""
+        key = self._sort_key
+        if key == "name":
+            return sorted(names, reverse=self._sort_desc)
+        have = [n for n in names if self._diag_metric(n, key) is not None]
+        miss = [n for n in names if self._diag_metric(n, key) is None]
+        have.sort(key=lambda n: (self._diag_metric(n, key), n),
+                  reverse=self._sort_desc)
+        return have + miss
+
+    def _on_header_clicked(self, col: int):
+        """点表头：同列切换升/降序，换列则从升序开始（与资源管理器一致）。"""
+        key = _LIST_COLS[col][0]
+        if key == self._sort_key:
+            self._sort_desc = not self._sort_desc
+        else:
+            self._sort_key = key
+            self._sort_desc = False
+        self._update_sort_indicator()
+        self._reload_sentence_list()
+
+    def _update_sort_indicator(self):
+        for i, (key, _t) in enumerate(_LIST_COLS):
+            if key == self._sort_key:
+                self.list.header().setSortIndicator(
+                    i, Qt.DescendingOrder if self._sort_desc else Qt.AscendingOrder)
+                return
+        self.list.header().setSortIndicator(0, Qt.AscendingOrder)
+
+    def _on_header_menu(self, pos):
+        """右键表头：勾选要显示的列（「添加项」，与资源管理器同一操作）。"""
+        menu = QMenu(self)
+        for i, (key, title) in enumerate(_LIST_COLS):
+            if key == "name":            # 名称列固定，不允许隐藏
+                continue
+            act = menu.addAction(title)
+            act.setCheckable(True)
+            act.setChecked(not self.list.isColumnHidden(i))
+            act.triggered.connect(
+                lambda checked, k=key: self._set_column_visible(k, checked))
+        menu.exec(self.list.header().viewport().mapToGlobal(pos))
+
+    def _set_column_visible(self, key: str, visible: bool):
+        idx = next(i for i, (k, _t) in enumerate(_LIST_COLS) if k == key)
+        self.list.setColumnHidden(idx, not visible)
+        # 被隐藏的列若正是当前排序列 → 回落到名称排序
+        if not visible and self._sort_key == key:
+            self._sort_key, self._sort_desc = "name", False
+        self._update_sort_indicator()
+        self._reload_sentence_list()
+
     def _diagnosis_tooltip(self, name: str) -> str:
         m = self._diagnosis.get(name)
         if not m:
@@ -843,17 +960,15 @@ class MainWindow(QMainWindow):
                 f"skipped tokens {m.get('num_skipped_tokens', '-')}")
 
     def _item_text(self, name: str) -> str:
-        """列表项文本：名称 + 质量分；**已人工编辑过的句前置 ✓ 标记**。"""
-        sc = Project.diagnosis_score(self._diagnosis.get(name))
-        base = f"{name}　{sc:.2f}" if sc is not None else name
+        """名称列文本：**已人工编辑过的句前置 ✓ 标记**（质量分在独立列）。"""
         edited = self.project is not None and name in self.project.edited
-        return f"✓ {base}" if edited else base
+        return f"✓ {name}" if edited else name
 
     def _list_item_named(self, name: str):
-        """按 UserRole 存的句名找列表项（item 文本带分数后缀，不能按 text 匹配）。"""
-        for i in range(self.list.count()):
-            if self.list.item(i).data(Qt.UserRole) == name:
-                return self.list.item(i)
+        """按 UserRole 存的句名找列表项（item 文本带 ✓ 前缀，不能按 text 匹配）。"""
+        for i in range(self.list.topLevelItemCount()):
+            if self.list.topLevelItem(i).data(0, Qt.UserRole) == name:
+                return self.list.topLevelItem(i)
         return None
 
     def _bind_worker(self):
@@ -899,7 +1014,7 @@ class MainWindow(QMainWindow):
         items = self.list.selectedItems()
         if not items:
             return
-        name = items[0].data(Qt.UserRole)
+        name = items[0].data(0, Qt.UserRole)
         if name == self._current:
             return
         self._save_current()
@@ -1191,23 +1306,24 @@ class MainWindow(QMainWindow):
             self.project.edited.add(self._current)
         item = self._list_item_named(self._current)
         if item is not None:
-            item.setText(self._item_text(self._current))
-            item.setForeground(Qt.gray)
+            item.setText(0, self._item_text(self._current))
+            for c in range(len(_LIST_COLS)):
+                item.setForeground(c, QColor(Qt.gray))
         self._update_progress()
 
     def _update_progress(self):
         """左侧列表底部进度条：已手工标记（✓ = 在 project.edited 里）的句数占比。"""
-        total = self.list.count()
+        total = self.list.topLevelItemCount()
         done = 0
         if self.project is not None:
             for i in range(total):
-                it = self.list.item(i)
-                if it is not None and it.data(Qt.UserRole) in self.project.edited:
+                it = self.list.topLevelItem(i)
+                if it is not None and it.data(0, Qt.UserRole) in self.project.edited:
                     done += 1
         pct = (done * 100.0 / total) if total else 0.0
         self.progress_bar.setRange(0, max(1, total))    # 0 句时不进「忙碌」态
         self.progress_bar.setValue(done)
-        self.progress_bar.setFormat(f"{done}/{total} · {pct:.0f}%")
+        self.progress_label.setText(f"{done}/{total} · {pct:.0f}%")
 
     def _refresh_views(self):
         for v in (self.view, self.spec_view, self.wave, self.curve):
