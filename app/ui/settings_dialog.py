@@ -361,7 +361,8 @@ class PalettePage(QWidget):
             ("wave_panel_color", "波形面板波形颜色"),
             ("wave_roll_color", "钢琴卷帘波形颜色"),
             ("curve_line_color", "口型曲线描边颜色"),
-            ("curve_fill_color", "口型曲线填充颜色"))
+            ("curve_fill_color", "口型曲线填充颜色"),
+            ("search_color", "音素搜索高亮颜色"))
 
     def __init__(self, settings: ProjectSettings, parent=None):
         super().__init__(parent)

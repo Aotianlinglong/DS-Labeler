@@ -547,6 +547,8 @@ class TimeCanvas(QWidget):
         self._samples: np.ndarray | None = None   # 当前句采样（波形面板 + 音符波形层共用）
         self._sr = 44100
         self._peak = 1.0
+        self.search_text = ""                  # 音素搜索词（小写）；非空时命中的音素时段常亮
+        self.search_color = QColor("#ff7ab6")  # 搜索高亮底色（设置→配色页可改）
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMinimumHeight(60)
@@ -614,6 +616,40 @@ class TimeCanvas(QWidget):
         self._cursor_t = -1.0
         self._pan_anchor = None
         self.update()
+
+    # ---- 音素搜索高亮（主窗口推送；筛选结果的「常亮」，与选中高亮刻意区分）----
+    SEARCH_ALPHA = 70
+
+    def set_search_text(self, text: str) -> None:
+        """音素搜索词（空 = 不筛选）：命中的音素时段在本画布上铺常亮底色。"""
+        text = (text or "").strip().lower()
+        text = text.split("/", 1)[-1]
+        if text == self.search_text:
+            return
+        self.search_text = text
+        self.update()
+
+    def set_search_color(self, value=None) -> None:
+        if value is None:
+            return
+        self.search_color = QColor(str(value))
+        self.update()
+
+    def _draw_search_bands(self, p: QPainter, phones, top: float, bottom: float) -> None:
+        """搜索命中的音素时段铺底色。
+
+        配色**刻意区别于「选中」高亮**（选中是蓝底）：搜索是常驻筛选、
+        选中是临时点选，同色会分不清哪个是筛选结果、哪个是当前操作对象。
+        """
+        if not self.search_text or not phones:
+            return
+        c = QColor(self.search_color)
+        c.setAlpha(self.SEARCH_ALPHA)
+        for s, e, m in phones:
+            if self.search_text != str(m).strip().lower().split("/", 1)[-1]:
+                continue
+            x0, x1 = self.t_to_x(s), self.t_to_x(e)
+            p.fillRect(QRectF(x0, top, max(1.0, x1 - x0), max(1.0, bottom - top)), c)
 
     def set_audio(self, samples: np.ndarray | None, sr: int):
         """挂上当前句音频（波形面板 + 钢琴卷帘的「音符波形」层共用同一份采样）。"""
@@ -898,6 +934,7 @@ class WaveformView(TimeCanvas):
         phones = self.model.phones if self.model else []
 
         if self._samples is None or len(self._samples) == 0:
+            self._draw_search_bands(p, phones, top, bottom)
             p.setPen(QColor("#667"))
             p.drawText(QRectF(GUTTER, top, self.plot_w(), max(1, bottom - top)),
                        Qt.AlignCenter, "无音频")
@@ -909,6 +946,7 @@ class WaveformView(TimeCanvas):
 
         # 波形本体交给基类的共用实现（与钢琴卷帘的波形段**逐像素同一套算法**，
         # 所以两处波形形状/配色/振幅比例完全一致，只是竖直空间大小不同）
+        self._draw_search_bands(p, phones, top, bottom)
         self._draw_wave_envelope(p, QRectF(GUTTER, top, self.plot_w(), max(1, bottom - top)))
         # 音素边界竖线贯穿波形（与 TierBar / 频谱+钢琴窗逐像素对齐）
         self._draw_phone_boundaries(p, phones, top, bottom)
@@ -1045,6 +1083,7 @@ class CurveCanvas(TimeCanvas):
         top, bottom = BAND_H, h
         phones = self.model.phones if self.model else []
 
+        self._draw_search_bands(p, phones, top, bottom)
         if self._curve is None or len(self._curve) == 0:
             p.setPen(QColor("#667"))
             p.drawText(QRectF(GUTTER, top, self.plot_w(), max(1, bottom - top)),
@@ -1553,6 +1592,7 @@ class SpectroRollView(TimeCanvas):
             self._draw_pitch_grid(p, top, bottom)
 
         # 3) 选中音素底色（TG 编辑：所有音素一律平等，不做无声/有声区分）
+        self._draw_search_bands(p, phones, top, bottom)
         #    注：曾按**光标悬停**高亮所在音素，快速浏览时很晃眼，已按要求移除；
         #    只保留「选中」高亮（点击/拖动产生的明确选中）。
         if 0 <= st.sel_phone < len(phones):

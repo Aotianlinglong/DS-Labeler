@@ -124,7 +124,7 @@ PANE_KEYS = ("wave", "roll", "curve", "spec")   # 面板标识：波形 / 钢琴
 #   音符填充 = 205 / 描边 = 220（描边由填充色向白混合 0.85 得到）、PIT = 205。
 # 口型曲线是「描边 + 填充」两色。
 BASE_COLOR_KEYS = ("note_color", "pit_color", "wave_panel_color", "wave_roll_color")
-COLOR_KEYS = BASE_COLOR_KEYS + ("curve_line_color", "curve_fill_color")
+COLOR_KEYS = BASE_COLOR_KEYS + ("curve_line_color", "curve_fill_color", "search_color")
 
 DEFAULT_COLORS: dict[str, str] = {
     "note_color": "#50beff",        # 普通音符填充（= rgb 80,190,255）
@@ -136,6 +136,9 @@ DEFAULT_COLORS: dict[str, str] = {
     # 口型曲线：亮蓝描边 + 深靛填充。背景不参与自定义——面板背景沿用软件主题色。
     "curve_line_color": "#7fb3ff",  # 口型曲线描边（= rgb 127,179,255）
     "curve_fill_color": "#303c5e",  # 口型曲线填充（= rgb 48,60,94）
+    # 音素搜索命中时段的常亮底色：**玫粉**，与「选中」高亮的蓝色刻意区分
+    # （搜索是常驻筛选结果、选中是当前操作对象，同色会分不清）。
+    "search_color": "#ff7ab6",      # = rgb 255,122,182
 }
 
 # 内置配色方案（下拉可选；方案 = 一组颜色的一次性预设）。
@@ -145,16 +148,20 @@ COLOR_SCHEMES: dict[str, dict[str, str]] = {
     "经典（默认）": dict(DEFAULT_COLORS),
     "落日暖橙": {"note_color": "#ffa726", "pit_color": "#ff7043",
                  "wave_panel_color": "#ffca28", "wave_roll_color": "#d8c7ae",
-                 "curve_line_color": "#ff8a4c", "curve_fill_color": "#4d3126"},
+                 "curve_line_color": "#ff8a4c", "curve_fill_color": "#4d3126",
+                 "search_color": "#e0578a"},
     "深海青蓝": {"note_color": "#26c6da", "pit_color": "#ffd54f",
                  "wave_panel_color": "#4fc3f7", "wave_roll_color": "#a9c3d0",
-                 "curve_line_color": "#29b6f6", "curve_fill_color": "#243b4a"},
+                 "curve_line_color": "#29b6f6", "curve_fill_color": "#243b4a",
+                 "search_color": "#ff8fb1"},
     "紫罗兰夜": {"note_color": "#9575cd", "pit_color": "#ce93d8",
                  "wave_panel_color": "#b39ddb", "wave_roll_color": "#c0b6d0",
-                 "curve_line_color": "#b39ddb", "curve_fill_color": "#3a2f4d"},
+                 "curve_line_color": "#b39ddb", "curve_fill_color": "#3a2f4d",
+                 "search_color": "#ff9ecb"},
     "樱花粉": {"note_color": "#f48fb1", "pit_color": "#ffcc80",
                "wave_panel_color": "#f8bbd0", "wave_roll_color": "#d8c8cf",
-               "curve_line_color": "#f06292", "curve_fill_color": "#4a2e3a"},
+               "curve_line_color": "#f06292", "curve_fill_color": "#4a2e3a",
+               "search_color": "#ff4d94"},
 }
 
 
@@ -233,6 +240,7 @@ class ProjectSettings:
     wave_roll_color: str = DEFAULT_COLORS["wave_roll_color"]   # 钢琴卷帘波形的颜色
     curve_line_color: str = DEFAULT_COLORS["curve_line_color"]  # 口型曲线描边颜色
     curve_fill_color: str = DEFAULT_COLORS["curve_fill_color"]  # 口型曲线填充颜色
+    search_color: str = DEFAULT_COLORS["search_color"]          # 音素搜索高亮颜色
     # 口型曲线纵轴是否**按当前句峰值自适应**（把该句最大张口顶到面板顶端；关掉则绝对标尺
     # 0 底 / 1 顶）。默认开——否则大多数句子的曲线都贴在底部一小条，看不出形状。
     curve_autoscale: bool = True
@@ -274,6 +282,7 @@ def settings_to_dict(s: ProjectSettings) -> dict:
         "wave_roll_color": s.wave_roll_color,
         "curve_line_color": s.curve_line_color,
         "curve_fill_color": s.curve_fill_color,
+        "search_color": s.search_color,
         "curve_autoscale": s.curve_autoscale,
         "color_presets": {k: dict(v) for k, v in s.color_presets.items()},
         "panel_order": list(s.panel_order),
@@ -309,6 +318,7 @@ def settings_from_dict(st: dict | None) -> ProjectSettings:
         wave_roll_color=str(st.get("wave_roll_color") or d.wave_roll_color),
         curve_line_color=str(st.get("curve_line_color") or d.curve_line_color),
         curve_fill_color=str(st.get("curve_fill_color") or d.curve_fill_color),
+        search_color=str(st.get("search_color") or d.search_color),
         curve_autoscale=bool(st.get("curve_autoscale", d.curve_autoscale)),
         color_presets=clean_presets(st.get("color_presets")),
         panel_order=_clean_panel_order(st.get("panel_order")),

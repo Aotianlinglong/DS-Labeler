@@ -18,6 +18,7 @@ from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QListWidget, QListWidgetItem, QVBoxLayout, QHBoxLayout,
     QFileDialog, QMessageBox, QInputDialog, QComboBox, QSplitter, QProgressBar,
+    QLineEdit,
 )
 
 import ui.theme as th
@@ -86,6 +87,9 @@ class MainWindow(QMainWindow):
         self.tg: SentenceData | None = None      # 源 TextGrid（texts/words/phones 三层参照）
         self._sentences: list[str] = []
         self._current: str = ""
+        # 音素搜索：每句的音素集合缓存（工作文件优先，其次源 TextGrid / csv）；
+        # 打开/切换工程时清空。搜索只在搜索词非空时才真正解析文件。
+        self._phone_sets: dict[str, set[str]] = {}
         # 切换/重建句子列表期间屏蔽选中事件：Qt 在 list.clear()/addItem() 时会自动
         # 发出 itemSelectionChanged（带旧行号、旧选中项），若照它去 _load_sentence，
         # 就会拿**上一份工程的句名**去新工程里找 wav（报"文件不存在/加载失败"），
@@ -137,15 +141,33 @@ class MainWindow(QMainWindow):
 
         self.main_split = main_split = QSplitter(Qt.Horizontal)   # 左列表 │ 右面板（尺寸进布局记忆）
 
-        # 左：句子列表（顶部排序：按名称 / 按标注质量分）
+        # 左：句子列表（顶部音素搜索 + 排序）
         left = QWidget()
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0, 0, 0, 0)
         lv.setSpacing(0)
+        # 列表顶部一行：音素搜索框（左，占满）+ 排序（右，窄）
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(6, 6, 6, 4)
+        top_row.setSpacing(6)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索音素（如 a、p、AP）")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.setToolTip("输入音素名后，左侧列表只显示含该音素的句子；"
+                                    "右侧该音素时段常亮（配色页可改常亮色）")
+        # 防抖：逐键触发会把整张表的声音素解析重跑一遍（首算要读 TextGrid/csv）
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(250)
+        self._search_timer.timeout.connect(self._reload_sentence_list)
+        self.search_edit.textChanged.connect(lambda _: self._search_timer.start())
+        top_row.addWidget(self.search_edit, 1)
         self.sort_combo = QComboBox()
         self.sort_combo.addItems(["按名称", "按分数（低→高）", "按分数（高→低）"])
         self.sort_combo.currentIndexChanged.connect(lambda _: self._reload_sentence_list())
-        lv.addWidget(self.sort_combo)
+        self.sort_combo.setFixedWidth(118)       # 排序只占窄栏，其余宽度留给搜索
+        top_row.addWidget(self.sort_combo)
+        lv.addLayout(top_row)
         self.list = QListWidget()
         self.list.itemSelectionChanged.connect(self._on_select_sentence)
         lv.addWidget(self.list, 1)
@@ -546,6 +568,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         self.project = proj
+        self._phone_sets = {}            # 音素搜索缓存只对当前工程有效
         # ✓ 标记只属于「人工编辑过」的句子（编辑必有自动保存的工作文件）。
         # 旧版曾把「预处理完成」也写进 edited，打开时把没有工作文件的条目剔掉。
         _gone = {n for n in proj.edited if not proj.sentence_work_file(n).exists()}
@@ -679,12 +702,15 @@ class MainWindow(QMainWindow):
         wr = st.wave_roll_color if st is not None else DEFAULT_COLORS["wave_roll_color"]
         cl = st.curve_line_color if st is not None else DEFAULT_COLORS["curve_line_color"]
         cf = st.curve_fill_color if st is not None else DEFAULT_COLORS["curve_fill_color"]
+        se = st.search_color if st is not None else DEFAULT_COLORS["search_color"]
         self.wave.set_wave_color(wp)
         for v in (self.view, self.spec_view):
             v.set_wave_color(wr)
             v.set_note_colors(note)
             v.set_pit_color(pit)
         self.curve.set_curve_colors(cl, cf)
+        for v in (self.view, self.spec_view, self.wave, self.curve):
+            v.set_search_color(se)
 
     def _refresh_language_state(self):
         """语言表/音素系统/全局音素/主语言变化后：重建分类器与音符标签。"""
@@ -699,6 +725,10 @@ class MainWindow(QMainWindow):
             f"语言设置已保存：主语言 {self.project.main_lang}", 5000)
 
     def _reload_sentence_list(self):
+        if self.project is None:         # 未打开工程：搜索框输入不重建列表
+            return
+        # 搜索词在 try 之外算：异常时不至于让后面的 `elif query` 取到未定义名
+        query = self._search_query()
         # 重建期间屏蔽选中事件（Qt 会在 clear()/addItem() 时自动发 itemSelectionChanged，
         # 带的是旧行号/旧选中项 → 会拿上一份工程的句名去新工程里找 wav 而报"加载失败"）
         self._switching = True
@@ -716,6 +746,10 @@ class MainWindow(QMainWindow):
                 names = sorted(self._sentences, key=key)
             else:
                 names = list(self._sentences)
+            # 音素搜索：只留含该音素的句子。按**裸音素名精确匹配**（"a" 不会
+            # 误伤 "aa"/"ia"；输入 "zh/a" 也自动按 "a" 匹配）
+            if query:
+                names = [n for n in names if query in self._sentence_phone_set(n)]
             for name in names:
                 sc = Project.diagnosis_score(self._diagnosis.get(name))
                 item = QListWidgetItem(self._item_text(name))
@@ -729,13 +763,14 @@ class MainWindow(QMainWindow):
         finally:
             self._switching = False
         self._update_progress()          # 列表重建后刷新底部「已标记」进度
+        self._apply_search()             # 搜索词推给各面板（命中的音素时段常亮）
         self._bind_worker()
         missing = [n for n in self._sentences if not self._is_ready(n)]
         self.statusBar().showMessage(
             f"工程：{self.project.name}｜主语言 {self.project.main_lang}｜"
             f"{len(self._sentences)} 句｜待预处理 {len(missing)}")
         self._log(f"打开工程 {self.project.name}（{len(self._sentences)} 句，待预处理 {len(missing)}）· build {BUILD}")
-        if self._sentences:
+        if names:
             # 记忆上次停留的句（工程侧车）；无记忆或已不在列表中 → 回落第一句
             # 行号必须按**列表显示顺序**取（按分数排序时显示序 ≠ 名称序）
             want = self.project.last_sentence
@@ -745,8 +780,55 @@ class MainWindow(QMainWindow):
             # 这时必须显式加载，否则打开工程后停在空白界面（"什么都没载入"）
             if self._current != names[row]:
                 self._load_sentence(names[row])
+        elif query:
+            self.statusBar().showMessage(
+                f"音素搜索「{query}」无匹配句子（本工程共 {len(self._sentences)} 句）")
         if missing and self.worker is not None:
             self.worker.enqueue(missing)
+
+    def _search_query(self) -> str:
+        """当前音素搜索词（小写裸音素名；空串 = 不筛选）。"""
+        ed = getattr(self, "search_edit", None)
+        text = (ed.text() if ed is not None else "").strip().lower()
+        return text.split("/", 1)[1] if "/" in text else text
+
+    def _sentence_phone_set(self, name: str) -> set[str]:
+        """句子的音素集合（搜索用）：工作文件优先，其次源 TextGrid（标准）/ csv（翻新）。
+
+        音素名统一去掉语言前缀（`zh/a` → `a`），与搜索框里输入的裸名一致。
+        结果按工程生命周期缓存——搜索逐键触发时不再重复解析文件。
+        """
+        if name in self._phone_sets:
+            return self._phone_sets[name]
+        sd = None
+        try:
+            path = self.project.sentence_work_file(name)
+            if path.exists():
+                sd = SentenceData.load(path, name)
+        except Exception:
+            sd = None
+        if sd is None:
+            try:
+                sd = (self.project.source_sentence(name) if self.project.is_refurbish
+                      else parse_textgrid(self.project.tg_dir / f"{name}.TextGrid", name))
+            except Exception:
+                sd = None
+        # 两种 SentenceData：工作文件/翻新 csv 是 list[(s,e,mark)]，
+        # TextGrid 解析的是带 .marks 的层对象 —— 两种都要能取到音素名。
+        if sd is None:
+            marks = set()
+        elif hasattr(sd.phones, "marks"):
+            marks = {str(m).strip().lower().split("/", 1)[-1] for m in sd.phones.marks}
+        else:
+            marks = {str(p[2]).strip().lower().split("/", 1)[-1] for p in sd.phones}
+        self._phone_sets[name] = marks
+        return marks
+
+    def _apply_search(self):
+        """把搜索词推给所有面板：命中的音素时段常亮（与列表筛选同一条件）。"""
+        q = self._search_query()
+        for v in (self.view, self.spec_view, self.wave, self.curve):
+            v.set_search_text(q)
 
     def _diagnosis_tooltip(self, name: str) -> str:
         m = self._diagnosis.get(name)
