@@ -13,12 +13,13 @@ import pathlib
 import re
 
 import soundfile as sf
-from PySide6.QtCore import Qt, QTimer, QSettings
-from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence, QShortcut
+from PySide6.QtCore import Qt, QTimer, QSettings, QPointF, QRectF, QSize
+from PySide6.QtGui import (QAction, QActionGroup, QColor, QIcon, QKeySequence, QPainter,
+                           QPen, QPixmap, QShortcut)
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QHBoxLayout,
     QFileDialog, QMessageBox, QInputDialog, QSplitter, QProgressBar, QLabel,
-    QLineEdit, QHeaderView, QAbstractItemView, QMenu,
+    QLineEdit, QHeaderView, QAbstractItemView, QMenu, QToolButton,
 )
 
 import ui.theme as th
@@ -83,6 +84,27 @@ def _safe_name(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', "_", (name or "").strip())
 
 
+def _bare_phone(token: str) -> str:
+    """音素名归一：小写、去掉语言前缀（`zh/a` → `a`）。"""
+    return str(token).strip().lower().split("/", 1)[-1]
+
+
+def _search_icon(color: str) -> QIcon:
+    """放大镜图标（运行时绘制，不依赖主题或资源文件）。"""
+    pm = QPixmap(18, 18)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(QColor(color))
+    pen.setWidth(2)
+    pen.setCapStyle(Qt.RoundCap)
+    p.setPen(pen)
+    p.drawEllipse(QRectF(2.0, 2.0, 10.0, 10.0))
+    p.drawLine(QPointF(11.5, 11.5), QPointF(16.0, 16.0))
+    p.end()
+    return QIcon(pm)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -102,9 +124,9 @@ class MainWindow(QMainWindow):
         self.tg: SentenceData | None = None      # 源 TextGrid（texts/words/phones 三层参照）
         self._sentences: list[str] = []
         self._current: str = ""
-        # 音素搜索：每句的音素集合缓存（工作文件优先，其次源 TextGrid / csv）；
-        # 打开/切换工程时清空。搜索只在搜索词非空时才真正解析文件。
-        self._phone_sets: dict[str, set[str]] = {}
+        # 音素搜索：每句的音素序列缓存（工作文件优先，其次源 TextGrid / csv）；
+        # 打开/切换工程时清空。只有点搜索（或 Enter）时才真正解析文件。
+        self._phone_lists: dict[str, list[str]] = {}
         # 句子列表排序（详细信息视图：点表头切换升降序）
         self._sort_key: str = "name"
         self._sort_desc: bool = False
@@ -164,22 +186,27 @@ class MainWindow(QMainWindow):
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0, 0, 0, 0)
         lv.setSpacing(0)
-        # 列表顶部一行：音素搜索框（占满整行）
+        # 列表顶部一行：音素搜索框（左，占满）+ 搜索按钮（右）
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("搜索音素（如 a、p、AP）")
+        self.search_edit.setPlaceholderText("搜索音素：空格分隔多个（任一命中）；[z ai] 搜连续序列")
         self.search_edit.setClearButtonEnabled(True)
-        self.search_edit.setToolTip("输入音素名后，左侧列表只显示含该音素的句子；"
-                                    "右侧该音素时段常亮（配色页可改常亮色）")
-        # 防抖：逐键触发会把整张表的声音素解析重跑一遍（首算要读 TextGrid/csv）
-        self._search_timer = QTimer(self)
-        self._search_timer.setSingleShot(True)
-        self._search_timer.setInterval(250)
-        self._search_timer.timeout.connect(self._reload_sentence_list)
-        self.search_edit.textChanged.connect(lambda _: self._search_timer.start())
+        self.search_edit.setToolTip("空格分隔多个音素 = 满足任一即显示；[z ai] = 按顺序连续出现的序列。\n"
+                                    "点搜索按钮或按 Enter 执行；命中的时段在右侧面板常亮。")
+        self.search_edit.returnPressed.connect(self._run_search)
+        # 点输入框右侧的叉（清空）要**立即撤销筛选**并恢复列表；
+        # 输入过程中仍不逐键搜索（只在点按钮 / Enter 时执行）。
+        self.search_edit.textChanged.connect(self._on_search_text_changed)
         top_row = QHBoxLayout()
         top_row.setContentsMargins(6, 6, 6, 4)
         top_row.setSpacing(6)
         top_row.addWidget(self.search_edit, 1)
+        self.search_btn = QToolButton()
+        self.search_btn.setIcon(_search_icon(th.TEXT_DIM))
+        self.search_btn.setIconSize(QSize(16, 16))
+        self.search_btn.setFixedSize(28, 28)
+        self.search_btn.setToolTip("搜索音素（也可按 Enter）")
+        self.search_btn.clicked.connect(self._run_search)
+        top_row.addWidget(self.search_btn)
         lv.addLayout(top_row)
         # 句子列表 = 资源管理器式「详细信息」视图：
         #   表头点击排序（升降序切换）、右键勾选「添加项」、列宽可拖。
@@ -611,7 +638,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         self.project = proj
-        self._phone_sets = {}            # 音素搜索缓存只对当前工程有效
+        self._phone_lists = {}           # 音素搜索缓存只对当前工程有效
         # ✓ 标记只属于「人工编辑过」的句子（编辑必有自动保存的工作文件）。
         # 旧版曾把「预处理完成」也写进 edited，打开时把没有工作文件的条目剔掉。
         _gone = {n for n in proj.edited if not proj.sentence_work_file(n).exists()}
@@ -770,8 +797,9 @@ class MainWindow(QMainWindow):
     def _reload_sentence_list(self):
         if self.project is None:         # 未打开工程：搜索框输入不重建列表
             return
-        # 搜索词在 try 之外算：异常时不至于让后面的 `elif query` 取到未定义名
-        query = self._search_query()
+        # 搜索项在 try 之外解析：异常时也不至于让后面的分支取到未定义名
+        text = (self.search_edit.text() if hasattr(self, "search_edit") else "").strip()
+        items = self._parse_search(text)
         # 重建期间屏蔽选中事件（Qt 会在 clear()/addItem() 时自动发 itemSelectionChanged，
         # 带的是旧行号/旧选中项 → 会拿上一份工程的句名去新工程里找 wav 而报"加载失败"）
         self._switching = True
@@ -779,10 +807,11 @@ class MainWindow(QMainWindow):
             self.list.clear()
             self._sentences = self.project.list_sentences()
             names = list(self._sentences)
-            # 音素搜索：只留含该音素的句子。按**裸音素名精确匹配**（"a" 不会
-            # 误伤 "aa"/"ia"；输入 "zh/a" 也自动按 "a" 匹配）
-            if query:
-                names = [n for n in names if query in self._sentence_phone_set(n)]
+            # 音素搜索：空格分隔的多项满足**任一**即显示（OR）；[z ai] 要求按序
+            # 连续出现。按裸音素名精确匹配（"a" 不误伤 "aa"/"ia"，"zh/a" → "a"）
+            if items:
+                names = [n for n in names
+                         if self._search_match(self._sentence_phones(n), items)]
             names = self._sort_names(names)
             for name in names:
                 sc = Project.diagnosis_score(self._diagnosis.get(name))
@@ -826,25 +855,74 @@ class MainWindow(QMainWindow):
             # 这时必须显式加载，否则打开工程后停在空白界面（"什么都没载入"）
             if self._current != names[row]:
                 self._load_sentence(names[row])
-        elif query:
+        if items:
             self.statusBar().showMessage(
-                f"音素搜索「{query}」无匹配句子（本工程共 {len(self._sentences)} 句）")
+                (f"音素搜索「{text}」：{len(names)}/{len(self._sentences)} 句" if names
+                 else f"音素搜索「{text}」无匹配句子（本工程共 {len(self._sentences)} 句）"),
+                5000)
         if missing and self.worker is not None:
             self.worker.enqueue(missing)
 
-    def _search_query(self) -> str:
-        """当前音素搜索词（小写裸音素名；空串 = 不筛选）。"""
-        ed = getattr(self, "search_edit", None)
-        text = (ed.text() if ed is not None else "").strip().lower()
-        return text.split("/", 1)[1] if "/" in text else text
+    def _on_search_text_changed(self, text: str) -> None:
+        """搜索框内容变化：只有**清空**（如点右侧叉）才立即撤销筛选。"""
+        if not (text or "").strip():
+            self._run_search()
 
-    def _sentence_phone_set(self, name: str) -> set[str]:
-        """句子的音素集合（搜索用）：工作文件优先，其次源 TextGrid（标准）/ csv（翻新）。
+    def _run_search(self):
+        """搜索按钮 / Enter：按当前输入重建列表（筛选 + 面板常亮）。"""
+        self._reload_sentence_list()
 
-        结果按工程生命周期缓存——搜索逐键触发时不再重复解析文件。
+    @staticmethod
+    def _parse_search(text: str) -> tuple[tuple[str, ...], ...]:
+        """解析搜索框：空格分隔的各项满足任一（OR）；`[z ai]` 为按序连续的序列。"""
+        text = (text or "").strip().lower()
+        items: list[tuple[str, ...]] = []
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if ch.isspace():
+                i += 1
+                continue
+            if ch == "[":                    # 组合：中括号内按空格分词，需连续相邻
+                j = text.find("]", i + 1)
+                if j < 0:
+                    j = n
+                seq = tuple(x for x in (_bare_phone(t) for t in text[i + 1:j].split()) if x)
+                if seq:
+                    items.append(seq)
+                i = j + 1
+                continue
+            j = i
+            while j < n and not text[j].isspace() and text[j] not in "[]":
+                j += 1
+            tok = _bare_phone(text[i:j])
+            if tok:
+                items.append((tok,))
+            i = j
+        return tuple(items)
+
+    @staticmethod
+    def _search_match(phones: list[str], items) -> bool:
+        """句子是否命中搜索项：单音素命中同名即算；音素组要求按序连续出现。"""
+        for seq in items:
+            if len(seq) == 1:
+                if seq[0] in phones:
+                    return True
+                continue
+            k = len(seq)
+            for i in range(len(phones) - k + 1):
+                if tuple(phones[i:i + k]) == seq:
+                    return True
+        return False
+
+    def _sentence_phones(self, name: str) -> list[str]:
+        """句子的音素序列（搜索用）：工作文件优先，其次源 TextGrid（标准）/ csv（翻新）。
+
+        音素名统一去掉语言前缀（`zh/a` → `a`），且**保持语序**（组合搜索要看相邻关系）。
+        结果按工程生命周期缓存——搜索只在点按钮/Enter 时触发，不逐键解析。
         """
-        if name in self._phone_sets:
-            return self._phone_sets[name]
+        if name in self._phone_lists:
+            return self._phone_lists[name]
         sd = None
         try:
             path = self.project.sentence_work_file(name)
@@ -861,19 +939,21 @@ class MainWindow(QMainWindow):
         # 工作文件 / 翻新 csv 的 phones 是 list[(s,e,mark)]，TextGrid 解析的是
         # 带 .marks 的层对象 —— 两种都要能取到音素名（否则搜索直接报错）。
         if sd is None:
-            marks = set()
+            seq = []
         elif hasattr(sd.phones, "marks"):
-            marks = {str(m).strip().lower().split("/", 1)[-1] for m in sd.phones.marks}
+            seq = [_bare_phone(m) for m in sd.phones.marks]
         else:
-            marks = {str(p[2]).strip().lower().split("/", 1)[-1] for p in sd.phones}
-        self._phone_sets[name] = marks
-        return marks
+            seq = [_bare_phone(p[2]) for p in sd.phones]
+        seq = [x for x in seq if x]
+        self._phone_lists[name] = seq
+        return seq
 
     def _apply_search(self):
-        """把搜索词推给所有面板：命中的音素时段常亮（与列表筛选同一条件）。"""
-        q = self._search_query()
+        """把搜索项推给所有面板：命中的音素时段常亮（与列表筛选同一条件）。"""
+        items = self._parse_search(
+            self.search_edit.text() if hasattr(self, "search_edit") else "")
         for v in (self.view, self.spec_view, self.wave, self.curve):
-            v.set_search_text(q)
+            v.set_search_pattern(items)
 
     # ---- 句子列表：详细信息视图（排序 / 添加列）----
     def _diag_metric(self, name: str, key: str):

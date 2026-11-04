@@ -547,7 +547,7 @@ class TimeCanvas(QWidget):
         self._samples: np.ndarray | None = None   # 当前句采样（波形面板 + 音符波形层共用）
         self._sr = 44100
         self._peak = 1.0
-        self.search_text = ""                  # 音素搜索词（小写）；非空时命中的音素时段常亮
+        self.search_items = ()                 # 音素搜索项（空 = 不筛选）
         self.search_color = QColor("#ff7ab6")  # 搜索高亮底色（设置→配色页可改）
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -620,13 +620,17 @@ class TimeCanvas(QWidget):
     # ---- 音素搜索高亮（主窗口推送；筛选结果的「常亮」，与选中高亮刻意区分）----
     SEARCH_ALPHA = 70
 
-    def set_search_text(self, text: str) -> None:
-        """音素搜索词（空 = 不筛选）：命中的音素时段在本画布上铺常亮底色。"""
-        text = (text or "").strip().lower()
-        text = text.split("/", 1)[-1]
-        if text == self.search_text:
+    def set_search_pattern(self, items=()) -> None:
+        """音素搜索项（空 = 不筛选）。
+
+        每项是一个音素序列：单项命中**所有**同名时段；多项序列（如 `[z ai]`）
+        只在画布上亮**按序连续**命中的那一段。
+        """
+        items = tuple(tuple(x for x in seq if x) for seq in (items or ()))
+        items = tuple(seq for seq in items if seq)
+        if items == self.search_items:
             return
-        self.search_text = text
+        self.search_items = items
         self.update()
 
     def set_search_color(self, value=None) -> None:
@@ -641,13 +645,24 @@ class TimeCanvas(QWidget):
         配色**刻意区别于「选中」高亮**（选中是蓝底）：搜索是常驻筛选、
         选中是临时点选，同色会分不清哪个是筛选结果、哪个是当前操作对象。
         """
-        if not self.search_text or not phones:
+        if not self.search_items or not phones:
+            return
+        marks = [str(m).strip().lower().split("/", 1)[-1] for _s, _e, m in phones]
+        hit: set[int] = set()
+        for seq in self.search_items:
+            if len(seq) == 1:
+                hit.update(i for i, mk in enumerate(marks) if mk == seq[0])
+                continue
+            k = len(seq)
+            for i in range(len(marks) - k + 1):
+                if tuple(marks[i:i + k]) == seq:
+                    hit.update(range(i, i + k))
+        if not hit:
             return
         c = QColor(self.search_color)
         c.setAlpha(self.SEARCH_ALPHA)
-        for s, e, m in phones:
-            if self.search_text != str(m).strip().lower().split("/", 1)[-1]:
-                continue
+        for i in sorted(hit):
+            s, e, _m = phones[i]
             x0, x1 = self.t_to_x(s), self.t_to_x(e)
             p.fillRect(QRectF(x0, top, max(1.0, x1 - x0), max(1.0, bottom - top)), c)
 
