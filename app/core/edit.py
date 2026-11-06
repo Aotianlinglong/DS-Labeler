@@ -578,15 +578,23 @@ def rename_phone(model: EditModel, index: int, name: str) -> bool:
 # ======================================================================
 # 音符：底层变更（mut_*）
 # ======================================================================
-def mut_split_note(md: EditModel, index: int, position: float) -> bool:
+def mut_split_note(md: EditModel, index: int, position: float,
+                   midis=(None, None)) -> bool:
     if not (0 <= index < len(md.notes)):
         return False
     n0 = md.notes[index]
     if not (n0.start + 1e-3 < position < n0.end - 1e-3):
         return False
-    old_end, midi, rest = n0.end, n0.midi, n0.rest
+    old_end, old_midi, rest = n0.end, n0.midi, n0.rest
+    left_midi, right_midi = midis if midis else (None, None)
+    # 两半各自用判定值对齐（切分后一次性）；没判定出的一侧保持原音高
+    if not rest:
+        if left_midi is not None:
+            n0.midi = _clamp_pitch(round(float(left_midi), 2))
+        if right_midi is not None:
+            old_midi = _clamp_pitch(round(float(right_midi), 2))
     n0.end = position
-    md.notes.insert(index + 1, Note(position, old_end, midi, slur=True, rest=rest))
+    md.notes.insert(index + 1, Note(position, old_end, old_midi, slur=True, rest=rest))
     return True
 
 
@@ -845,14 +853,20 @@ def mut_delete_note(md: EditModel, index: int) -> bool:
 
 
 # ---- 音符：公开命令 ------------------------------------------------------
-def split_note(model: EditModel, index: int, position: float) -> bool:
-    """双击音符块：在点击时间切分，后半标记为连音(slur)。"""
+def split_note(model: EditModel, index: int, position: float,
+               midis=(None, None)) -> bool:
+    """双击音符块：在点击时间切分，后半标记为连音(slur)。
+
+    `midis` 是切分点前后两半的传统音高判定结果（`core.pitch`），形如
+    (前半, 后半)；给了就写回对应音符，None 的一侧保持原音高。
+    判定失败传 (None, None) → 两半都沿用原音高。
+    """
     if not (0 <= index < len(model.notes)):
         return False
     n0 = model.notes[index]
     if not (n0.start + 1e-3 < position < n0.end - 1e-3):
         return False
-    model.run("切分音符", lambda md: mut_split_note(md, index, position))
+    model.run("切分音符", lambda md: mut_split_note(md, index, position, midis))
     return True
 
 

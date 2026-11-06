@@ -33,6 +33,7 @@ from PySide6.QtWidgets import QWidget, QInputDialog, QMenu
 from core import edit
 from core.edit import EditModel
 from core.notes import Note
+from core.pitch import estimate_midi_from_f0, estimate_note_midi
 from core.project import DEFAULT_COLORS
 from core.spectrogram import SpecData, make_cmap, CMAPS, DEFAULT_CMAP
 
@@ -2186,9 +2187,30 @@ class SpectroRollView(TimeCanvas):
 
     # ---- 音符动作 ----
     def _act_split(self, i: int, t: float):
-        if edit.split_note(self.model, i, t):
+        # 切分后**前后两半**都用音高判定结果对齐：只在这一刻算一次，不给手动入口；
+        # 结果随切分一起进同一步撤销，之后仍可手动改音高。
+        # 判定优先用已加载的 F0 曲线（RMVPE 缓存，查表即可，不读音频）；
+        # 该句没有 F0 缓存时才退回现场跑 YIN（音频样本已在内存，不落盘）。
+        midis = (None, None)
+        notes = self.model.notes if self.model is not None else []
+        if 0 <= i < len(notes) and not notes[i].rest:
+            n0 = notes[i]
+            left, right = self._split_midi_pair(n0.start, t, n0.end)
+            midis = (left, right)
+        if edit.split_note(self.model, i, t, midis):
             self.sig_changed.emit()
             self.update()
+
+    def _split_midi_pair(self, t0: float, t_cut: float, t1: float):
+        """切分点两侧的音高：F0 曲线优先，缺失时回退音频 YIN。"""
+        f0, hop = self._f0, self._f0_hop
+        if f0 is not None and hop and hop > 0:
+            left = estimate_midi_from_f0(f0, hop, t0, t_cut)
+            right = estimate_midi_from_f0(f0, hop, t_cut, t1)
+            if left is not None or right is not None:
+                return left, right
+        return (estimate_note_midi(self._samples, self._sr, t0, t_cut),
+                estimate_note_midi(self._samples, self._sr, t_cut, t1))
 
     def _act_slur(self, i: int):
         if edit.toggle_slur(self.model, i):
